@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Secrets and local config (NEVER commit)
+.env
+.env.local
+
+# Steam machine-auth / sentry persistence (sensitive, account-bound)
+.steam/
+
+# Cached DS query token
+.cache/
+
+# Logs
+*.log
