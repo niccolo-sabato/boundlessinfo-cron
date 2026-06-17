@@ -27,7 +27,7 @@ concurrency:
 jobs:
   capture:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
 
@@ -63,3 +63,18 @@ jobs:
           SCAN_MAX: '8300'
           DS_DELAY_MS: '250'
           WORLD_DELAY_MS: '250'
+
+      # Headless live block-colour capture for every world (perms + public
+      # sovereigns from discovery + exos from our API). Connects to each world's
+      # game websocket with the rich DS-login JWT, reads config.world.blockColors,
+      # and ingests. No proxy, no game client.
+      - name: Capture live block colours (all worlds)
+        working-directory: bot
+        run: npm run capture -- --all
+        env:
+          STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
+          STEAM_PASSWORD: ${{ secrets.STEAM_PASSWORD }}
+          BOUNDLESS_USERNAME: ${{ secrets.BOUNDLESS_USERNAME }}
+          BOUNDLESS_PASSWORD: ${{ secrets.BOUNDLESS_PASSWORD }}
+          BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}

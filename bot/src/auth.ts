@@ -41,6 +41,8 @@ export interface QueryToken {
   username: string;
   /** Unix ms at which this token was minted (for the 12h TTL). */
   mintedAt: number;
+  /** The rich account JWT (DS /login `token` field): the game websocket auth token. */
+  gameToken: string;
 }
 
 const TWELVE_HOURS_MS = 43_200_000;
@@ -105,7 +107,7 @@ async function getBoundlessSessionCookie(): Promise<string> {
  * Step 3: exchange the web session for the game JWT. Ported from
  * `_get_game_jwt`. The JWT is in response.data.
  */
-async function getGameJwt(): Promise<string> {
+export async function getGameJwt(): Promise<string> {
   const cookie = await getBoundlessSessionCookie();
 
   const res = await fetchWithTimeout(
@@ -118,6 +120,9 @@ async function getGameJwt(): Promise<string> {
   }
 
   const data = (await res.json()) as { data?: string };
+  if (process.env.CAPTURE_DEBUG) {
+    console.error("[gamejwt] raw keys:", Object.keys(data), "| data len:", (data.data ?? "").length, "| full:", JSON.stringify(data).slice(0, 400));
+  }
   if (!data?.data) {
     throw new Error("Game JWT response missing `data` field");
   }
@@ -139,6 +144,7 @@ function readCachedToken(username: string): QueryToken | null {
     const cached = JSON.parse(readFileSync(QUERY_TOKEN_CACHE_FILE, "utf8")) as QueryToken;
     if (cached.username !== username) return null;
     if (Date.now() - cached.mintedAt > TWELVE_HOURS_MS) return null;
+    if (!cached.gameToken) return null; // cache from before gameToken existed -> force re-mint
     return cached;
   } catch {
     return null;
@@ -193,17 +199,25 @@ export async function getQueryToken(
     throw new Error(`DS /login failed: HTTP ${res.status} ${await safeText(res)}`);
   }
 
-  const data = (await res.json()) as { characters?: BoundlessCharacter[]; queryToken?: string };
+  const data = (await res.json()) as {
+    characters?: BoundlessCharacter[];
+    queryToken?: string;
+    token?: string;
+  };
   if (!data.characters || data.characters.length === 0) {
     throw new Error("DS /login returned no character on this universe");
   }
   if (!data.queryToken) {
     throw new Error("DS /login response missing queryToken");
   }
+  if (!data.token) {
+    throw new Error("DS /login response missing the game token (websocket auth JWT)");
+  }
 
   const token: QueryToken = {
     player: data.characters[0],
     token: data.queryToken,
+    gameToken: data.token,
     username,
     mintedAt: Date.now(),
   };

@@ -13,7 +13,8 @@
     "diag": "node --experimental-strip-types src/diag.ts",
     "diag-poll": "node --experimental-strip-types src/diag-poll.ts",
     "run": "node --experimental-strip-types src/index.ts",
-    "poll-once": "node --experimental-strip-types src/index.ts"
+    "poll-once": "node --experimental-strip-types src/index.ts",
+    "capture": "node --experimental-strip-types src/capture-cli.ts"
   },
   "dependencies": {
     "steam-user": "^5.2.0"
