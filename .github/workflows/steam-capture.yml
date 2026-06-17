@@ -78,3 +78,16 @@ jobs:
           BOUNDLESS_PASSWORD: ${{ secrets.BOUNDLESS_PASSWORD }}
           BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+
+      # Orbited ("closest") world + blinksec distance for every world (esp. exos,
+      # whose assignment is read from the authenticated /gameserver world-config).
+      - name: Capture orbited-world distances (all worlds)
+        working-directory: bot
+        run: npm run distances
+        env:
+          STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
+          STEAM_PASSWORD: ${{ secrets.STEAM_PASSWORD }}
+          BOUNDLESS_USERNAME: ${{ secrets.BOUNDLESS_USERNAME }}
+          BOUNDLESS_PASSWORD: ${{ secrets.BOUNDLESS_PASSWORD }}
+          BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
