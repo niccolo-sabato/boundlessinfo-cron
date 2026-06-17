@@ -1,45 +1,54 @@
 /**
- * `npm run distances` - for every live world, read its orbited world from the
- * authenticated /gameserver world-config and query the blinksec distance to it,
- * then ingest the { worldId: {assignment, distance} } map into our Worker. Works
- * for exos (whose assignment is absent from the public discovery). Run after the
- * colour capture in the same cron job, reusing the already-minted query token.
+ * `npm run distances` - for every Sovereign / Exo world, find the closest
+ * PERMANENT world (minimum blinksec distance over the perms in its region) and
+ * ingest the { worldId: {assignment: closestPermId, distance} } map into our
+ * Worker. Run after the colour capture in the same cron job, reusing the token.
  */
 import { config } from "./config.ts";
 import { getQueryToken } from "./auth.ts";
-import { getAssignment, getWorldDistance, ingestDistances, type WorldDistanceInfo } from "./distances.ts";
+import { getWorldDistance, ingestDistances, type WorldDistanceInfo } from "./distances.ts";
+
+type DW = { id?: number; region?: string; lifetime?: unknown; sovereign?: boolean };
 
 async function main() {
   const token = await getQueryToken();
 
   const res = await fetch(`${config.dsBase}/list-gameservers`);
   if (!res.ok) throw new Error(`discovery HTTP ${res.status}`);
-  const worlds = (await res.json()) as { id?: number }[];
-  const ids = worlds.filter((w) => typeof w?.id === "number").map((w) => w.id as number);
-  console.log(`[distance] ${ids.length} live worlds`);
+  const worlds = (await res.json()) as DW[];
+
+  const valid = worlds.filter((w) => typeof w.id === "number");
+  // Permanent = no lifetime and not a sovereign; target = sovereign or exo (has lifetime).
+  const perms = valid.filter((w) => !Array.isArray(w.lifetime) && w.sovereign !== true);
+  const targets = valid.filter((w) => w.sovereign === true || Array.isArray(w.lifetime));
+  console.log(`[distance] ${targets.length} targets (sov/exo), ${perms.length} perms`);
 
   const out: Record<string, WorldDistanceInfo> = {};
   let i = 0;
-  for (const id of ids) {
+  for (const t of targets) {
     i++;
-    try {
-      const assignment = await getAssignment(token, id);
-      if (assignment != null && assignment !== id) {
-        await new Promise((r) => setTimeout(r, 350));
-        const distance = await getWorldDistance(token, id, assignment);
-        if (distance != null) {
-          out[String(id)] = { assignment, distance };
-          console.log(`[distance] (${i}/${ids.length}) ${id} -> ${assignment}: ${distance} blinksecs`);
-        } else {
-          console.log(`[distance] (${i}/${ids.length}) ${id} -> ${assignment}: no distance`);
-        }
-      } else {
-        console.log(`[distance] (${i}/${ids.length}) ${id}: no assignment`);
+    // The nearest perm is essentially always in the same region (blink space is
+    // per-region); fall back to all perms if a region somehow has none.
+    let cands = perms.filter((p) => p.region === t.region);
+    if (cands.length === 0) cands = perms;
+
+    let best: { id: number; dist: number } | null = null;
+    for (const p of cands) {
+      try {
+        const d = await getWorldDistance(token, t.id as number, p.id as number);
+        if (d != null && (best === null || d < best.dist)) best = { id: p.id as number, dist: d };
+      } catch {
+        /* skip this pair */
       }
-    } catch (e) {
-      console.error(`[distance] ${id} failed:`, (e as Error).message);
+      await new Promise((r) => setTimeout(r, 220));
     }
-    await new Promise((r) => setTimeout(r, 350));
+
+    if (best) {
+      out[String(t.id)] = { assignment: best.id, distance: best.dist };
+      console.log(`[distance] (${i}/${targets.length}) ${t.id}: closest perm ${best.id} @ ${best.dist} blinksecs`);
+    } else {
+      console.log(`[distance] (${i}/${targets.length}) ${t.id}: no perm distance`);
+    }
   }
 
   const ok = await ingestDistances(out);
