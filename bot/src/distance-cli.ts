@@ -20,8 +20,13 @@ async function main() {
   const valid = worlds.filter((w) => typeof w.id === "number");
   // Permanent = no lifetime and not a sovereign; target = sovereign or exo (has lifetime).
   const perms = valid.filter((w) => !Array.isArray(w.lifetime) && w.sovereign !== true);
-  const targets = valid.filter((w) => w.sovereign === true || Array.isArray(w.lifetime));
-  console.log(`[distance] ${targets.length} targets (sov/exo), ${perms.length} perms`);
+  let targets = valid.filter((w) => w.sovereign === true || Array.isArray(w.lifetime));
+
+  // Optional CLI ids (e.g. `npm run distances -- 7890 7891`): scan only those
+  // targets. Used by the 10-min poll to compute a freshly-spawned world at once.
+  const idArgs = process.argv.slice(2).map(Number).filter((n) => Number.isInteger(n) && n > 0);
+  if (idArgs.length) targets = targets.filter((t) => idArgs.includes(t.id as number));
+  console.log(`[distance] ${targets.length} targets${idArgs.length ? " (specified ids)" : " (sov/exo)"}, ${perms.length} perms`);
 
   const out: Record<string, WorldDistanceInfo> = {};
   let i = 0;
