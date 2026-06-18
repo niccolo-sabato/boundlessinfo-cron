@@ -96,3 +96,19 @@ jobs:
           BOUNDLESS_PASSWORD: ${{ secrets.BOUNDLESS_PASSWORD }}
           BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+
+      # Capture the new worlds' block colours right away too, so a freshly-spawned
+      # exo/sovereign shows its real colours within the 10-minute cycle instead of
+      # waiting for the 6-hour full pass. Steam session is already restored above;
+      # the query token is reused from cache, so this is a quick headless pass.
+      - name: Capture block colours for the new worlds
+        if: steps.detect.outputs.has_new == 'true'
+        working-directory: bot
+        run: npm run capture -- ${{ steps.detect.outputs.ids }}
+        env:
+          STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
+          STEAM_PASSWORD: ${{ secrets.STEAM_PASSWORD }}
+          BOUNDLESS_USERNAME: ${{ secrets.BOUNDLESS_USERNAME }}
+          BOUNDLESS_PASSWORD: ${{ secrets.BOUNDLESS_PASSWORD }}
+          BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
