@@ -10,24 +10,35 @@
  */
 
 import { config } from "./config.ts";
-import { scanWorlds } from "./discover.ts";
+import { scanWorlds, scanWorldIds, type DiscoveredWorld } from "./discover.ts";
 import { ingestWorlds } from "./ingest.ts";
 
-async function main(): Promise<void> {
-  const { scanMin, scanMax } = config;
+function logWorld(w: DiscoveredWorld): void {
+  const kind = w.sovereign ? "sovereign" : w.lifetime ? "exo" : "perm";
   console.log(
-    `[run] scanning world ids ${scanMin}..${scanMax} against ${config.dsBase} ` +
-      `(${scanMax - scanMin + 1} ids)`,
+    `  + world ${w.id} ${w.displayName ?? w.name ?? "?"} [${kind}] resources=${w.resources.length}`,
   );
+}
+
+async function main(): Promise<void> {
+  // Optional CLI ids (`npm run run -- 7893 7901`): refresh worlds + resources for
+  // just those ids (used by the 10-min poll for freshly detected new worlds).
+  const idArgs = process.argv.slice(2).map(Number).filter((n) => Number.isInteger(n) && n > 0);
 
   const started = Date.now();
-  const { worlds, scanned, found } = await scanWorlds(scanMin, scanMax, (w) => {
-    const kind = w.sovereign ? "sovereign" : w.lifetime ? "exo" : "perm";
+  let scanResult;
+  if (idArgs.length) {
+    console.log(`[run] scanning ${idArgs.length} specified world id(s): ${idArgs.join(", ")}`);
+    scanResult = await scanWorldIds(idArgs, (w) => logWorld(w));
+  } else {
+    const { scanMin, scanMax } = config;
     console.log(
-      `  + world ${w.id} ${w.displayName ?? w.name ?? "?"} ` +
-        `[${kind}] resources=${w.resources.length}`,
+      `[run] scanning world ids ${scanMin}..${scanMax} against ${config.dsBase} ` +
+        `(${scanMax - scanMin + 1} ids)`,
     );
-  });
+    scanResult = await scanWorlds(scanMin, scanMax, (w) => logWorld(w));
+  }
+  const { worlds, scanned, found } = scanResult;
 
   const elapsed = ((Date.now() - started) / 1000).toFixed(1);
   console.log(`[run] scanned ${scanned} ids, found ${found} world(s) in ${elapsed}s`);

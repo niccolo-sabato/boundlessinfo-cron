@@ -1,14 +1,21 @@
 name: Poll live worlds
 
-# Public repo => unlimited free GitHub Actions. Fetches the game's public discovery
-# server (port 8902 - Cloudflare Workers cannot, GitHub runners can) and writes the
-# raw payload to the Boundless Info KV namespace. The Worker normalizes it on read.
+# Runs every 10 minutes. Two detection paths, so the full live universe is current
+# within one cycle:
 #
-# It then detects freshly-spawned Sovereign/Exo worlds that lack a closest-world
-# distance and scans JUST those immediately (Steam login runs only when there is a
-# new world), so a new exo's closest world appears within the 10-minute cycle rather
-# than waiting for the 6-hour full pass. Needs the same Steam/Boundless secrets as
-# steam-capture for that conditional step.
+#  1. PUBLIC discovery (port 8902 list-gameservers) -> permanents + public/rented
+#     sovereigns. Written to KV only when the stable world set changed (KV write
+#     quota is the scarce 1k/day resource).
+#  2. FRONTIER probe -> exoworlds + private sovereigns are NOT in the public
+#     discovery, so we authenticate and probe a small dynamic id window just above
+#     the highest id we already know (ids are incremental). The DS query token is
+#     cached 12h and persisted across runs (a 12h-bucketed cache key), so the Steam/
+#     Boundless login happens ~twice a day, NOT every cycle - only ~45 lightweight
+#     /gameserver probes per cycle.
+#
+# Any freshly-detected Sovereign OR Exo (no closest-world distance yet) then gets a
+# full refresh - resources + block colours + distance - in the same cycle. The 6-hour
+# steam-capture remains the backstop that re-captures everything and covers gaps.
 
 on:
   schedule:
@@ -19,36 +26,39 @@ concurrency:
   group: poll-worlds
   cancel-in-progress: true
 
+env:
+  NS: dce399dc16a54d1aad5860cf201c41e9
+  STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
+  STEAM_PASSWORD: ${{ secrets.STEAM_PASSWORD }}
+  BOUNDLESS_USERNAME: ${{ secrets.BOUNDLESS_USERNAME }}
+  BOUNDLESS_PASSWORD: ${{ secrets.BOUNDLESS_PASSWORD }}
+  BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
+  INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+  DS_DELAY_MS: '200'
+  WORLD_DELAY_MS: '200'
+
 jobs:
   poll:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
 
+      # --- 1. Public discovery (perms + public sovereigns) ---
       - name: Fetch live discovery (port 8902)
         run: curl -sS --fail --max-time 60 "https://ds.playboundless.com:8902/list-gameservers" -o worlds.json
 
       - name: Sanity check payload
         run: node -e "const w=require('./worlds.json'); if(!Array.isArray(w)||w.length===0){console.error('empty/invalid');process.exit(1)}; console.log('worlds:',w.length)"
 
-      # Write worlds:raw ONLY when the meaningful world set changed. The discovery
-      # payload carries volatile fields (_lastUpdate timestamp, info.players) that
-      # differ on every fetch, so a naive compare would never skip. We strip those
-      # and compare the stable per-world metadata: most 10-min polls are no-ops, so
-      # this turns ~144 KV writes/day (the scarce 1k/day quota) into ~144 cheap
-      # reads (the 100k/day quota) plus a handful of real writes when worlds spawn,
-      # expire or get re-themed.
       - name: Upload raw payload to Cloudflare KV (only when worlds changed)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          NS=dce399dc16a54d1aad5860cf201c41e9
           npx --yes wrangler@4 kv key get "worlds:raw" --namespace-id "$NS" --remote > prev.json 2>/dev/null || true
           CHANGED=$(node -e '
             const fs = require("fs");
@@ -67,17 +77,12 @@ jobs:
             echo "worlds:raw unchanged (only volatile fields differ); skipping write"
           fi
 
-      - name: Detect new sovereign/exo worlds without a distance
-        id: detect
-        run: node detect-new-worlds.mjs
-
+      # --- 2. Frontier probe: discover exos / private sovereigns (authenticated) ---
       - name: Install bot dependencies
-        if: steps.detect.outputs.has_new == 'true'
         working-directory: bot
         run: npm install --no-audit --no-fund
 
       - name: Restore Steam refresh token (headless login)
-        if: steps.detect.outputs.has_new == 'true'
         working-directory: bot
         run: |
           mkdir -p .steam
@@ -85,30 +90,46 @@ jobs:
         env:
           STEAM_REFRESH_TOKEN: ${{ secrets.STEAM_REFRESH_TOKEN }}
 
-      - name: Scan closest world for the new worlds
+      # The DS query token is valid ~12h. Bucket the cache key to 12h so a fresh
+      # Steam/Boundless login runs at most ~twice a day; every other cycle restores
+      # the cached token and only probes /gameserver. (No KV writes involved.)
+      - name: Compute 12h token-cache key
+        id: bucket
+        run: echo "key=ds-token-$(date -u +%Y%m%d)-$(( $(date -u +%H) / 12 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Restore/persist cached DS query token
+        uses: actions/cache@v4
+        with:
+          path: bot/.cache
+          key: ${{ steps.bucket.outputs.key }}
+
+      - name: Compute frontier scan window
+        id: frontier
+        run: node compute-frontier.mjs
+
+      - name: Discover exo/sovereign frontier (ingest new worlds + resources)
+        working-directory: bot
+        run: npm run run
+        env:
+          SCAN_MIN: ${{ steps.frontier.outputs.scan_min }}
+          SCAN_MAX: ${{ steps.frontier.outputs.scan_max }}
+
+      # --- 3. Full refresh for any freshly-detected new Sovereign OR Exo ---
+      - name: Detect new sovereign/exo worlds without a distance
+        id: detect
+        run: node detect-new-worlds.mjs
+
+      - name: Refresh resources for the new worlds
         if: steps.detect.outputs.has_new == 'true'
         working-directory: bot
-        run: npm run distances -- ${{ steps.detect.outputs.ids }}
-        env:
-          STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
-          STEAM_PASSWORD: ${{ secrets.STEAM_PASSWORD }}
-          BOUNDLESS_USERNAME: ${{ secrets.BOUNDLESS_USERNAME }}
-          BOUNDLESS_PASSWORD: ${{ secrets.BOUNDLESS_PASSWORD }}
-          BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
-          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+        run: npm run run -- ${{ steps.detect.outputs.ids }}
 
-      # Capture the new worlds' block colours right away too, so a freshly-spawned
-      # exo/sovereign shows its real colours within the 10-minute cycle instead of
-      # waiting for the 6-hour full pass. Steam session is already restored above;
-      # the query token is reused from cache, so this is a quick headless pass.
       - name: Capture block colours for the new worlds
         if: steps.detect.outputs.has_new == 'true'
         working-directory: bot
         run: npm run capture -- ${{ steps.detect.outputs.ids }}
-        env:
-          STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
-          STEAM_PASSWORD: ${{ secrets.STEAM_PASSWORD }}
-          BOUNDLESS_USERNAME: ${{ secrets.BOUNDLESS_USERNAME }}
-          BOUNDLESS_PASSWORD: ${{ secrets.BOUNDLESS_PASSWORD }}
-          BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
-          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+
+      - name: Scan closest world for the new worlds
+        if: steps.detect.outputs.has_new == 'true'
+        working-directory: bot
+        run: npm run distances -- ${{ steps.detect.outputs.ids }}

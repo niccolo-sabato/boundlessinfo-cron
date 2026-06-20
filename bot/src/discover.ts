@@ -251,11 +251,25 @@ export async function scanWorlds(
   scanMax: number,
   onProgress?: (world: DiscoveredWorld, index: number) => void,
 ): Promise<ScanResult> {
+  const ids: number[] = [];
+  for (let id = scanMin; id <= scanMax; id++) ids.push(id);
+  return scanWorldIds(ids, onProgress);
+}
+
+/**
+ * Probe a SPECIFIC list of world ids (same per-world logic as the range scan).
+ * Used by the 10-minute poll to fetch worlds + resources for just the freshly
+ * detected new Sovereign/Exo ids, instead of re-sweeping a whole range.
+ */
+export async function scanWorldIds(
+  ids: number[],
+  onProgress?: (world: DiscoveredWorld, index: number) => void,
+): Promise<ScanResult> {
   let token = await getQueryToken();
   const worlds: DiscoveredWorld[] = [];
   let scanned = 0;
 
-  for (let id = scanMin; id <= scanMax; id++) {
+  for (const id of ids) {
     scanned++;
     let response: GameServerResponse | null;
     try {
