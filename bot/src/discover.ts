@@ -199,7 +199,10 @@ export function parseSettlements(leaderboard: unknown): IngestSettlement[] {
         mayorName: typeof entry?.mayor?.name === "string" ? entry.mayor.name : null,
       };
     })
-    .filter((s) => s.name.length > 0);
+    // Keep real settlements even when unnamed (a beacon cluster with no chosen name):
+    // Boundlexx keeps them and the site renders them as "Unnamed settlement". Only drop
+    // fully-empty padding rows (no name AND no prestige).
+    .filter((s) => s.name.length > 0 || s.prestige > 0);
 }
 
 /** Map a raw worldData (+ optional poll) into the ingest world shape. */

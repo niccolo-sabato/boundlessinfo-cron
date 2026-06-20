@@ -113,3 +113,24 @@ jobs:
           BOUNDLESS_PASSWORD: ${{ secrets.BOUNDLESS_PASSWORD }}
           BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+
+      # Refresh SETTLEMENTS for every perm + sovereign. Settlements (the prestige
+      # leaderboard) are dynamic, but the frontier scan above only covers the new-world
+      # id window, so permanents and older sovereigns kept stale settlements from the
+      # initial scan. Re-scanning them here picks up new/grown/abandoned settlements every
+      # 6h; resources are fixed so the change-aware ingest skips those writes.
+      - name: Detect perm + sovereign worlds (settlement refresh)
+        id: setworlds
+        run: node detect-settlement-worlds.mjs
+
+      - name: Refresh settlements for perms + sovereigns
+        if: steps.setworlds.outputs.has_worlds == 'true'
+        working-directory: bot
+        run: npm run run -- ${{ steps.setworlds.outputs.ids }}
+        env:
+          STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
+          STEAM_PASSWORD: ${{ secrets.STEAM_PASSWORD }}
+          BOUNDLESS_USERNAME: ${{ secrets.BOUNDLESS_USERNAME }}
+          BOUNDLESS_PASSWORD: ${{ secrets.BOUNDLESS_PASSWORD }}
+          BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
