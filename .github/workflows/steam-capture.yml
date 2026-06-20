@@ -93,3 +93,23 @@ jobs:
           BOUNDLESS_PASSWORD: ${{ secrets.BOUNDLESS_PASSWORD }}
           BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+
+      # Self-heal resource coverage: backfill any live world that still has no captured
+      # resources (legacy public sovereigns below the scan frontier, e.g. Hyrule). World
+      # resources are fixed at spawn, so once filled they persist and this becomes a
+      # no-op; the change-aware ingest skips the KV write when nothing changed.
+      - name: Detect live worlds missing resources
+        id: missing
+        run: node detect-missing-resources.mjs
+
+      - name: Backfill resources for worlds missing them
+        if: steps.missing.outputs.has_missing == 'true'
+        working-directory: bot
+        run: npm run run -- ${{ steps.missing.outputs.ids }}
+        env:
+          STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
+          STEAM_PASSWORD: ${{ secrets.STEAM_PASSWORD }}
+          BOUNDLESS_USERNAME: ${{ secrets.BOUNDLESS_USERNAME }}
+          BOUNDLESS_PASSWORD: ${{ secrets.BOUNDLESS_PASSWORD }}
+          BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
