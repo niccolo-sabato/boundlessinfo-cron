@@ -16,7 +16,7 @@ import { ingestWorlds } from "./ingest.ts";
 function logWorld(w: DiscoveredWorld): void {
   const kind = w.sovereign ? "sovereign" : w.lifetime ? "exo" : "perm";
   console.log(
-    `  + world ${w.id} ${w.displayName ?? w.name ?? "?"} [${kind}] resources=${w.resources.length}`,
+    `  + world ${w.id} ${w.displayName ?? w.name ?? "?"} [${kind}] resources=${w.resources?.length ?? "skip"}`,
   );
 }
 

@@ -21,13 +21,15 @@ on:
   workflow_dispatch: {}
 
 concurrency:
-  group: steam-capture
+  # Shared with poll-worlds: both non-atomically read-merge-write the single worlds:exos
+  # KV key, so they are serialized into one group to avoid a lost-update race.
+  group: boundless-ingest
   cancel-in-progress: false
 
 jobs:
   capture:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -47,6 +49,14 @@ jobs:
         env:
           STEAM_REFRESH_TOKEN: ${{ secrets.STEAM_REFRESH_TOKEN }}
 
+      # World ids grow incrementally, so a hardcoded SCAN_MAX would eventually fall behind
+      # the live spawn frontier and stop the 6h re-discovery backstop. Track it: scan up to
+      # max(8300, maxKnownId + 200) so the window always covers where new worlds appear.
+      - name: Compute frontier SCAN_MAX
+        id: window
+        run: >
+          node -e "fetch('https://boundlessinfo-api.niccolo-sabato.workers.dev/api/v2/worlds?limit=500').then(r=>r.json()).then(j=>{const m=Math.max(0,...(j.results||[]).map(w=>w.id||0));const smax=Math.max(8300,m+200);require('fs').appendFileSync(process.env.GITHUB_OUTPUT,'scan_max='+smax+'\n');console.log('frontier SCAN_MAX',smax,'(maxId',m+')')}).catch(e=>{require('fs').appendFileSync(process.env.GITHUB_OUTPUT,'scan_max=8300\n');console.log('frontier fallback 8300',e&&e.message)})"
+
       - name: Discover + ingest (frontier scan)
         working-directory: bot
         run: npm run run
@@ -58,9 +68,9 @@ jobs:
           BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
           # Exos and private sovereigns live at the current id frontier; perms are
-          # stable and were captured once locally. Widen if needed.
+          # stable and were captured once locally. SCAN_MAX tracks the live max id.
           SCAN_MIN: '6000'
-          SCAN_MAX: '8300'
+          SCAN_MAX: ${{ steps.window.outputs.scan_max }}
           DS_DELAY_MS: '250'
           WORLD_DELAY_MS: '250'
 
@@ -81,10 +91,14 @@ jobs:
           BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
 
-      # Orbited ("closest") world + blinksec distance for every world (esp. exos,
-      # whose assignment is read from the authenticated /gameserver world-config).
-      - name: Capture orbited-world distances (all worlds)
+      # Orbited ("closest") world + blinksec distance, only for worlds still MISSING one
+      # (distances are static, so distance-cli skips already-resolved worlds). Bounded by
+      # a per-step timeout + continue-on-error so a slow distance pass can never eat the
+      # job budget and starve the settlement/resource backstops that run after it.
+      - name: Capture orbited-world distances (missing only)
         working-directory: bot
+        continue-on-error: true
+        timeout-minutes: 12
         run: npm run distances
         env:
           STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
@@ -122,6 +136,9 @@ jobs:
       - name: Detect perm + sovereign worlds (settlement refresh)
         id: setworlds
         run: node detect-settlement-worlds.mjs
+        env:
+          SCAN_MIN: '6000'
+          SCAN_MAX: ${{ steps.window.outputs.scan_max }}
 
       - name: Refresh settlements for perms + sovereigns
         if: steps.setworlds.outputs.has_worlds == 'true'

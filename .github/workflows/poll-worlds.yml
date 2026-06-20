@@ -23,8 +23,12 @@ on:
   workflow_dispatch: {}
 
 concurrency:
-  group: poll-worlds
-  cancel-in-progress: true
+  # Shared with steam-capture: both do a non-atomic read-merge-write of the single
+  # worlds:exos KV key, so they must never run at the same time (no lost-update race).
+  # cancel-in-progress is false so a poll waits for an in-flight capture rather than
+  # cancelling it; polls are short and the capture also discovers worlds meanwhile.
+  group: boundless-ingest
+  cancel-in-progress: false
 
 env:
   NS: dce399dc16a54d1aad5860cf201c41e9

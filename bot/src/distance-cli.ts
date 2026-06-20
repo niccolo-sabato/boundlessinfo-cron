@@ -9,24 +9,50 @@ import { getQueryToken } from "./auth.ts";
 import { getWorldDistance, ingestDistances, type WorldDistanceInfo } from "./distances.ts";
 
 type DW = { id?: number; region?: string; lifetime?: unknown; sovereign?: boolean };
+type ApiWorld = { id: number; region?: string; is_perm?: boolean; is_sovereign?: boolean; is_exo?: boolean; distance?: number | null };
 
 async function main() {
   const token = await getQueryToken();
 
-  const res = await fetch(`${config.dsBase}/list-gameservers`);
-  if (!res.ok) throw new Error(`discovery HTTP ${res.status}`);
-  const worlds = (await res.json()) as DW[];
-
-  const valid = worlds.filter((w) => typeof w.id === "number");
-  // Permanent = no lifetime and not a sovereign; target = sovereign or exo (has lifetime).
-  const perms = valid.filter((w) => !Array.isArray(w.lifetime) && w.sovereign !== true);
-  let targets = valid.filter((w) => w.sovereign === true || Array.isArray(w.lifetime));
-
-  // Optional CLI ids (e.g. `npm run distances -- 7890 7891`): scan only those
-  // targets. Used by the 10-min poll to compute a freshly-spawned world at once.
   const idArgs = process.argv.slice(2).map(Number).filter((n) => Number.isInteger(n) && n > 0);
-  if (idArgs.length) targets = targets.filter((t) => idArgs.includes(t.id as number));
-  console.log(`[distance] ${targets.length} targets${idArgs.length ? " (specified ids)" : " (sov/exo)"}, ${perms.length} perms`);
+
+  // Source live worlds from OUR OWN API: it carries perms + public AND PRIVATE
+  // sovereigns + exos (the public /list-gameservers omits exos and private sovereigns),
+  // and each world's current `distance` so we can skip ones already resolved.
+  let api: ApiWorld[] = [];
+  try {
+    const ar = await fetch(`${config.apiBase}/api/v2/worlds?limit=500`);
+    if (ar.ok) api = ((await ar.json()) as { results?: ApiWorld[] }).results ?? [];
+  } catch {
+    /* API unreachable: fall back to discovery below */
+  }
+
+  let perms: DW[];
+  let targets: DW[];
+  if (api.length > 1) {
+    perms = api.filter((w) => w.is_perm).map((w) => ({ id: w.id, region: w.region }));
+    if (idArgs.length) {
+      const byId = new Map(api.map((w) => [w.id, w] as const));
+      targets = idArgs.map((id) => ({ id, region: byId.get(id)?.region }));
+    } else {
+      // Distances are STATIC (a world's blinksec distance to its nearest perm does not
+      // change), so only compute the ones still MISSING. This bounds the full pass to
+      // newly-appeared worlds instead of re-scanning every sovereign/exo every 6h, and
+      // it now also covers private sovereigns + exos that public discovery hid.
+      targets = api
+        .filter((w) => (w.is_sovereign || w.is_exo) && w.distance == null)
+        .map((w) => ({ id: w.id, region: w.region }));
+    }
+  } else {
+    // Fallback: our API was unreachable, use the public discovery (perms + public sovs).
+    const res = await fetch(`${config.dsBase}/list-gameservers`);
+    if (!res.ok) throw new Error(`discovery HTTP ${res.status}`);
+    const valid = ((await res.json()) as DW[]).filter((w) => typeof w.id === "number");
+    perms = valid.filter((w) => !Array.isArray(w.lifetime) && w.sovereign !== true);
+    const all = valid.filter((w) => w.sovereign === true || Array.isArray(w.lifetime));
+    targets = idArgs.length ? idArgs.map((id) => valid.find((w) => w.id === id) ?? ({ id } as DW)) : all;
+  }
+  console.log(`[distance] ${targets.length} targets${idArgs.length ? " (specified ids)" : " (missing only)"}, ${perms.length} perms`);
 
   const out: Record<string, WorldDistanceInfo> = {};
   let i = 0;

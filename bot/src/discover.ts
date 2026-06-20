@@ -87,8 +87,14 @@ export interface DiscoveredWorld {
   owner: number | null;
   apiURL: string | null;
   websocketURL: string | null;
-  resources: IngestResource[];
-  settlements: IngestSettlement[];
+  // OMITTED (undefined) when the world poll failed/400'd or the world was locked, so the
+  // ingest preserves the last good capture instead of wiping it with an empty array.
+  // Present (possibly empty) only when the poll succeeded.
+  resources?: IngestResource[];
+  settlements?: IngestSettlement[];
+  /** True once a resource poll was ATTEMPTED (success, empty, 400 or locked-skip). Lets
+   * the missing-resources self-heal converge instead of re-probing unfillable worlds. */
+  resourcesScanned: boolean;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -205,13 +211,20 @@ export function parseSettlements(leaderboard: unknown): IngestSettlement[] {
     .filter((s) => s.name.length > 0 || s.prestige > 0);
 }
 
-/** Map a raw worldData (+ optional poll) into the ingest world shape. */
+/**
+ * Map a raw worldData (+ optional poll result) into the ingest world shape.
+ * Pass `resources`/`settlements` ONLY when the poll succeeded; leave them undefined on
+ * a failed/400 poll or a locked world so the API ingest preserves the last good capture
+ * (an undefined field is omitted from the JSON and never overwrites stored data).
+ * `resourcesScanned` is always true: a poll was attempted (or deliberately skipped for a
+ * locked world), so the missing-resources self-heal can mark this world as handled.
+ */
 export function toDiscoveredWorld(
   data: WorldData,
-  resources: IngestResource[],
-  settlements: IngestSettlement[] = [],
+  resources?: IngestResource[],
+  settlements?: IngestSettlement[],
 ): DiscoveredWorld {
-  return {
+  const world: DiscoveredWorld = {
     id: data.id,
     name: data.name ?? null,
     displayName: data.displayName ?? null,
@@ -228,9 +241,11 @@ export function toDiscoveredWorld(
     owner: typeof data.owner === "number" ? data.owner : null,
     apiURL: data.apiURL ?? null,
     websocketURL: data.websocketURL ?? null,
-    resources,
-    settlements,
+    resourcesScanned: true,
   };
+  if (resources !== undefined) world.resources = resources;
+  if (settlements !== undefined) world.settlements = settlements;
+  return world;
 }
 
 export interface ScanResult {
@@ -290,8 +305,10 @@ export async function scanWorldIds(
     if (response === null) continue; // missing id
 
     const data = response.worldData;
-    let resources: IngestResource[] = [];
-    let settlements: IngestSettlement[] = [];
+    // Leave these undefined unless the poll SUCCEEDS, so a 400/error/locked world omits
+    // them from the ingest and the API preserves the last good capture (no wipe).
+    let resources: IngestResource[] | undefined;
+    let settlements: IngestSettlement[] | undefined;
 
     if (!data.locked && data.apiURL) {
       try {
@@ -300,9 +317,10 @@ export async function scanWorldIds(
         settlements = parseSettlements(poll.leaderboard);
       } catch (err) {
         const status = (err as Error & { status?: number }).status;
-        // Sovereign worlds returning 400 on poll is expected: skip the poll.
+        // Sovereign worlds returning 400 on poll is expected: skip the poll. resources/
+        // settlements stay undefined -> omitted from the POST -> stored data preserved.
         if (data.sovereign === true && status === 400) {
-          console.warn(`world ${id} (sovereign): poll 400, skipping resources`);
+          console.warn(`world ${id} (sovereign): poll 400, preserving stored resources/settlements`);
         } else {
           console.error(`world ${id} poll: ${(err as Error).message}`);
         }

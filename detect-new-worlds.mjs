@@ -10,7 +10,7 @@
  * carry the exos, and distance-cli can scan ids absent from discovery (it looks the
  * region up from the API), so we drive detection off the API here. Never fails the poll.
  */
-import { readFileSync, appendFileSync } from 'node:fs';
+import { appendFileSync } from 'node:fs';
 
 const API = 'https://boundlessinfo-api.niccolo-sabato.workers.dev/api/v2/worlds?limit=500';
 const out = process.env.GITHUB_OUTPUT;
@@ -24,20 +24,10 @@ function emit(ids) {
 }
 
 try {
-  // Reachability is mandatory, or we churn forever: the API's sovereign set
-  // accumulates STALE sovereigns (expired, no longer in the live universe) that
-  // a distance scan can never resolve, so flagging them re-runs a Steam login +
-  // scan + a `distances` KV read/write on every 10-minute poll for nothing.
-  //   - sovereigns: keep only those still in the live DS discovery (worlds.json)
-  //   - exos: are reachable but ABSENT from /list-gameservers, so accept them
-  //     from the API directly, but only while still active (end in the future).
-  const disc = JSON.parse(readFileSync('worlds.json', 'utf8'));
-  const liveSov = new Set(
-    (Array.isArray(disc) ? disc : [])
-      .filter((w) => w && typeof w.id === 'number' && (w.sovereign === true || Array.isArray(w.lifetime)))
-      .map((w) => w.id)
-  );
-
+  // Source candidates from our own API, which returns only worlds still in the live
+  // universe (loadWorlds drops expired exos / de-rented sovereigns). So a distance-less
+  // sovereign or active exo in the API is genuinely reachable - no need to cross-check
+  // public discovery, which would wrongly exclude PRIVATE sovereigns (never in worlds.json).
   const res = await fetch(API);
   const j = res.ok ? await res.json() : { results: [] };
   const now = Date.now();
@@ -46,7 +36,11 @@ try {
     .filter((w) =>
       w.is_exo
         ? !w.end || new Date(w.end).getTime() > now // active exo
-        : w.is_sovereign && liveSov.has(w.id) // sovereign still live in discovery
+        // Any sovereign the live API returns is reachable: the API already drops worlds
+        // that have left the universe, so we no longer require public-discovery membership
+        // (that wrongly excluded PRIVATE sovereigns, which never appear in worlds.json).
+        // The liveSov set is still used as a cheap freshness hint for logging only.
+        : w.is_sovereign
     )
     .map((w) => w.id)
     .slice(0, 25);
