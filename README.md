@@ -38,23 +38,25 @@ service (credentials stay in secrets, never committed).
    roughly 144 cheap reads (against the 100k/day read quota) plus a handful of real
    writes when worlds spawn, expire, or get re-themed. The Worker normalizes the
    raw payload on read.
-3. **Detect new sovereign/exo worlds without a distance** (`detect-new-worlds.mjs`):
+3. **Frontier exo/sovereign probe** (every cycle): exoworlds and private sovereigns
+   are not in the public discovery, so the bot probes a small dynamic id window just
+   above the highest id we already know (`compute-frontier.mjs` reads the max id from
+   the API; ~46 `/gameserver` probes per cycle, since ids are incremental). The DS
+   query token is cached 12h and persisted across runs with `actions/cache` (a
+   12h-bucketed key), so the Steam/Boundless login happens ~twice a day, not every
+   cycle. `npm run run` then ingests any newly-found worlds + their resources. (The
+   bucket-key step uses `10#` to force base-10: `date +%H` is zero-padded, and bash
+   would otherwise read `08/09/18/19` as invalid octal and fail those hours.)
+4. **Detect new sovereign/exo worlds without a distance** (`detect-new-worlds.mjs`):
    reads the live API for the current sovereign/exo set and finds ids that still
-   lack a closest-world distance. Exos are absent from the discovery payload, so
-   detection is driven off the project's own API (which does carry exos) rather
-   than off `worlds.json`. Only *reachable* candidates are emitted: active exos
-   (end date in the future) and sovereigns still present in the live discovery,
-   capped at 25 ids. This avoids re-scanning stale sovereigns forever. The step is
-   non-fatal: any failure emits an empty list and the poll still succeeds.
-4. **Conditional Steam pass** (runs only when `has_new == 'true'`): installs bot
-   deps, restores the Steam refresh token from a secret for **headless login** (no
-   2FA in CI), then runs both:
-   - `npm run distances -- <ids>` to compute each new world's closest world and
-     blinksec distance, and
-   - `npm run capture -- <ids>` to capture each new world's live block colours.
-
-   So a freshly-spawned exo/sovereign gets its closest world and real colours
-   within the 10-minute cycle instead of waiting for the 6-hour full pass.
+   lack a closest-world distance, capped at 25 reachable ids (active exos + sovereigns
+   still in discovery). Non-fatal: any failure emits an empty list and the poll still
+   succeeds.
+5. **Conditional fast-pass** (runs only when `has_new == 'true'`): for each freshly
+   detected id, `npm run run -- <ids>` (resources), `npm run capture -- <ids>` (live
+   block colours) and `npm run distances -- <ids>` (closest world). So a new
+   exo/sovereign gets its colours, resources and distance within the 10-minute cycle
+   instead of waiting for the 6-hour full pass.
 
 ### steam-capture.yml (every 6 hours)
 
@@ -67,12 +69,18 @@ three stages:
    resources + settlements, and POSTs them to the ingest API. Scans the configured
    id frontier (`SCAN_MIN` / `SCAN_MAX`, with `DS_DELAY_MS` / `WORLD_DELAY_MS`
    throttling).
-2. `npm run capture -- --all`: live block-colour capture for **every** world
-   (perms + public sovereigns from discovery + exos from the API). Connects to each
-   world's game websocket with the DS-login JWT, reads the world's block colours,
-   and ingests. No proxy, no game client.
+2. `npm run capture -- --non-perm`: live block-colour capture for **sovereigns + exos**
+   (their colours can change / are captured on spawn). Permanent worlds are skipped:
+   their colours are fixed and served from the static snapshot, so re-capturing them is
+   wasted work and account load. Connects to each world's game websocket with the
+   DS-login JWT, reads the world's block colours, and ingests. No proxy, no game client.
 3. `npm run distances`: orbited ("closest") world plus blinksec distance for every
    world, with the exo assignment read from the authenticated world-config.
+4. **Self-heal resource coverage** (`detect-missing-resources.mjs` -> `npm run run -- <ids>`):
+   asks the API which live worlds still have no captured resources (legacy public
+   sovereigns below the scan frontier whose resources were never read, e.g. Hyrule) and
+   scans exactly those. World resources are fixed at spawn, so once filled they persist
+   and the change-aware ingest skips the KV write; this step then becomes a no-op.
 
 ### keepalive.yml (1st and 15th of each month)
 
