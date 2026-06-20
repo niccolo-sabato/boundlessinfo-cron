@@ -95,7 +95,10 @@ jobs:
       # the cached token and only probes /gameserver. (No KV writes involved.)
       - name: Compute 12h token-cache key
         id: bucket
-        run: echo "key=ds-token-$(date -u +%Y%m%d)-$(( $(date -u +%H) / 12 ))" >> "$GITHUB_OUTPUT"
+        # 10# forces base-10: `date +%H` is zero-padded (08, 09, 18, 19) and bash would
+        # otherwise read those as octal, where 8/9 are invalid digits -> the step errored
+        # out at hours 08/09/18/19 UTC and failed the whole poll for those hours.
+        run: echo "key=ds-token-$(date -u +%Y%m%d)-$(( 10#$(date -u +%H) / 12 ))" >> "$GITHUB_OUTPUT"
 
       - name: Restore/persist cached DS query token
         uses: actions/cache@v4
