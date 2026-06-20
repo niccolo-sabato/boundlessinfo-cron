@@ -65,6 +65,28 @@ async function getSovereignIds(): Promise<number[]> {
   return [];
 }
 
+/**
+ * Worlds with LIVE-captured colours that are worth refreshing: Sovereign (colours can
+ * change) + Exo (colours are fixed, but this is a cheap backstop if the 10-min poll's
+ * colour capture for a newly-spawned exo ever failed). Permanent worlds are excluded:
+ * their colours are fixed and served from the static snapshot, so capturing them is wasted.
+ */
+async function getNonPermIds(): Promise<number[]> {
+  try {
+    const r = await fetch(`${config.apiBase}/api/v2/worlds?limit=500`);
+    if (r.ok) {
+      const list = ((await r.json()) as { results?: { id?: number; is_perm?: boolean }[] }).results ?? [];
+      return list
+        .filter((w) => !w.is_perm)
+        .map((w) => w.id)
+        .filter((n): n is number => Number.isFinite(n) && (n as number) > 0);
+    }
+  } catch {
+    /* API unreachable */
+  }
+  return [];
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   let ids: number[];
@@ -74,6 +96,9 @@ async function main(): Promise<void> {
   } else if (args.includes("--sovereigns")) {
     ids = await getSovereignIds();
     console.log(`[capture] --sovereigns: ${ids.length} sovereign worlds`);
+  } else if (args.includes("--non-perm")) {
+    ids = await getNonPermIds();
+    console.log(`[capture] --non-perm: ${ids.length} sovereign + exo worlds`);
   } else {
     ids = args.map(Number).filter((n) => Number.isFinite(n) && n > 0);
   }

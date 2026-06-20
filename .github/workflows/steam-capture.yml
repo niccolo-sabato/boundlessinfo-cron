@@ -64,14 +64,15 @@ jobs:
           DS_DELAY_MS: '250'
           WORLD_DELAY_MS: '250'
 
-      # Periodic block-colour refresh for SOVEREIGN worlds only: their owners can
-      # re-theme, so their colours change over time. Permanent worlds have fixed
-      # colours forever and exoworlds keep their spawn colours for life, so they are
-      # never re-captured here (new exos are colour-captured once, on discovery, by
-      # the 10-minute poll). The colour ingest skips the KV write when unchanged.
-      - name: Capture live block colours (sovereigns only)
+      # Periodic block-colour refresh for the worlds with LIVE colours: sovereigns
+      # (owners re-theme, so colours change) + exos (a cheap backstop in case the
+      # 10-minute poll's colour capture for a new exo ever failed - exos are few).
+      # Permanent worlds are skipped: their colours are fixed and served from the
+      # static snapshot, so re-capturing them is wasted work + account load. The
+      # colour ingest skips the KV write when a world's colours are unchanged.
+      - name: Capture live block colours (sovereigns + exos)
         working-directory: bot
-        run: npm run capture -- --sovereigns
+        run: npm run capture -- --non-perm
         env:
           STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
           STEAM_PASSWORD: ${{ secrets.STEAM_PASSWORD }}
