@@ -158,3 +158,16 @@ jobs:
           BOUNDLESS_PASSWORD: ${{ secrets.BOUNDLESS_PASSWORD }}
           BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+
+      # --- Notify Telegram if any non-tolerated step above failed (best-effort, no-op if unset) ---
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            curl -sS -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+              -d chat_id="$TG_CHAT" \
+              --data-urlencode "text=Boundless cron FAILED: ${{ github.workflow }} (run #${{ github.run_number }}) ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
