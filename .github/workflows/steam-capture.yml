@@ -39,7 +39,15 @@ jobs:
 
       - name: Install bot dependencies
         working-directory: bot
-        run: npm install --no-audit --no-fund
+        # Retry transient registry errors (ECONNRESET etc.) so a network blip during install
+        # does not fail the 6-hour capture; only a persistent failure surfaces.
+        run: |
+          for i in 1 2 3; do
+            npm install --no-audit --no-fund --fetch-retries=5 --fetch-retry-maxtimeout=120000 && break
+            if [ "$i" -eq 3 ]; then echo "npm install failed after 3 attempts"; exit 1; fi
+            echo "npm install attempt $i failed (transient network); retrying in 15s..."
+            sleep 15
+          done
 
       - name: Restore Steam refresh token (headless login)
         working-directory: bot

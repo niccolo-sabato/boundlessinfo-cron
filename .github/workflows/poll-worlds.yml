@@ -53,7 +53,9 @@ jobs:
 
       # --- 1. Public discovery (perms + public sovereigns) ---
       - name: Fetch live discovery (port 8902)
-        run: curl -sS --fail --max-time 60 "https://ds.playboundless.com:8902/list-gameservers" -o worlds.json
+        # Retry transient network errors (timeouts, resets, 5xx): the discovery host has
+        # occasional blips and a single miss must not fail the whole 10-minute poll.
+        run: curl -sS --fail --max-time 60 --retry 3 --retry-delay 5 --retry-all-errors "https://ds.playboundless.com:8902/list-gameservers" -o worlds.json
 
       - name: Sanity check payload
         run: node -e "const w=require('./worlds.json'); if(!Array.isArray(w)||w.length===0){console.error('empty/invalid');process.exit(1)}; console.log('worlds:',w.length)"
@@ -84,7 +86,16 @@ jobs:
       # --- 2. Frontier probe: discover exos / private sovereigns (authenticated) ---
       - name: Install bot dependencies
         working-directory: bot
-        run: npm install --no-audit --no-fund
+        # npm install hit a transient ECONNRESET to the registry on 2026-06-24 and failed the
+        # whole poll. Retry up to 3 times (plus npm's own fetch retries) so a registry blip is
+        # absorbed instead of paging us; only a persistent failure surfaces.
+        run: |
+          for i in 1 2 3; do
+            npm install --no-audit --no-fund --fetch-retries=5 --fetch-retry-maxtimeout=120000 && break
+            if [ "$i" -eq 3 ]; then echo "npm install failed after 3 attempts"; exit 1; fi
+            echo "npm install attempt $i failed (transient network); retrying in 15s..."
+            sleep 15
+          done
 
       - name: Restore Steam refresh token (headless login)
         working-directory: bot
