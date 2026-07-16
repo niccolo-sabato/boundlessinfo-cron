@@ -1,0 +1,23 @@
+{
+  "name": "boundlessinfo-steam-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Steam-login discovery bot for Boundless Info. Authenticates with the owner's own Steam + Boundless player account (no blessed API key), discovers live exoworlds + their world poll resources by probing world IDs against the universe discovery server, and POSTs the results to the Boundless Info ingest API. Faithfully ported from the MIT-licensed Boundlexx (Angellus) game client.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "bootstrap": "node --experimental-strip-types src/bootstrap.ts",
+    "spike": "node --experimental-strip-types src/spike.ts",
+    "diag": "node --experimental-strip-types src/diag.ts",
+    "diag-poll": "node --experimental-strip-types src/diag-poll.ts",
+    "run": "node --experimental-strip-types src/index.ts",
+    "poll-once": "node --experimental-strip-types src/index.ts",
+    "capture": "node --experimental-strip-types src/capture-cli.ts",
+    "distances": "node --experimental-strip-types src/distance-cli.ts"
+  },
+  "dependencies": {
+    "steam-user": "^5.2.0"
+  }
+}

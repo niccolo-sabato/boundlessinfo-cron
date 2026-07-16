@@ -1,0 +1,181 @@
+# Authenticated Steam-login capture: discovers current exoworlds + private
+# sovereigns (not in public discovery) and refreshes resources + settlements for
+# the frontier, then POSTs them to the Boundless Info ingest API.
+#
+# REQUIRES these repository Secrets (Settings -> Secrets and variables -> Actions):
+#   STEAM_USERNAME, STEAM_PASSWORD                  (the Steam account)
+#   BOUNDLESS_USERNAME, BOUNDLESS_PASSWORD          (the playboundless.com web login, email)
+#   BOUNDLESS_ACCOUNT_USERNAME                      (the Boundless account handle)
+#   INGEST_TOKEN                                    (same value as the Worker secret)
+#   STEAM_REFRESH_TOKEN                             (contents of bot/.steam/refresh-token.json,
+#                                                    produced locally by `npm run bootstrap` once)
+#
+# The refresh token makes the login headless (no 2FA in CI). Re-run bootstrap
+# locally and update the secret if it ever expires.
+
+name: steam-capture
+
+on:
+  schedule:
+    - cron: '23 */6 * * *' # every 6 hours, off the :00 mark
+  workflow_dispatch: {}
+
+concurrency:
+  # Shared with poll-worlds: both non-atomically read-merge-write the single worlds:exos
+  # KV key, so they are serialized into one group to avoid a lost-update race.
+  group: boundless-ingest
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install bot dependencies
+        working-directory: bot
+        # Retry transient registry errors (ECONNRESET etc.) so a network blip during install
+        # does not fail the 6-hour capture; only a persistent failure surfaces.
+        run: |
+          for i in 1 2 3; do
+            npm install --no-audit --no-fund --fetch-retries=5 --fetch-retry-maxtimeout=120000 && break
+            if [ "$i" -eq 3 ]; then echo "npm install failed after 3 attempts"; exit 1; fi
+            echo "npm install attempt $i failed (transient network); retrying in 15s..."
+            sleep 15
+          done
+
+      - name: Restore Steam refresh token (headless login)
+        working-directory: bot
+        run: |
+          mkdir -p .steam
+          printf '%s' "$STEAM_REFRESH_TOKEN" > .steam/refresh-token.json
+        env:
+          STEAM_REFRESH_TOKEN: ${{ secrets.STEAM_REFRESH_TOKEN }}
+
+      # World ids grow incrementally, so a hardcoded SCAN_MAX would eventually fall behind
+      # the live spawn frontier and stop the 6h re-discovery backstop. Track it: scan up to
+      # max(8300, maxKnownId + 200) so the window always covers where new worlds appear.
+      - name: Compute frontier SCAN_MAX
+        id: window
+        run: >
+          node -e "fetch('https://boundlessinfo-api.niccolo-sabato.workers.dev/api/v2/worlds?limit=500').then(r=>r.json()).then(j=>{const m=Math.max(0,...(j.results||[]).map(w=>w.id||0));const smax=Math.max(8300,m+200);require('fs').appendFileSync(process.env.GITHUB_OUTPUT,'scan_max='+smax+'\n');console.log('frontier SCAN_MAX',smax,'(maxId',m+')')}).catch(e=>{require('fs').appendFileSync(process.env.GITHUB_OUTPUT,'scan_max=8300\n');console.log('frontier fallback 8300',e&&e.message)})"
+
+      - name: Discover + ingest (frontier scan)
+        working-directory: bot
+        timeout-minutes: 20
+        run: npm run run
+        env:
+          STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
+          STEAM_PASSWORD: ${{ secrets.STEAM_PASSWORD }}
+          BOUNDLESS_USERNAME: ${{ secrets.BOUNDLESS_USERNAME }}
+          BOUNDLESS_PASSWORD: ${{ secrets.BOUNDLESS_PASSWORD }}
+          BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          # Exos and private sovereigns live at the current id frontier; perms are
+          # stable and were captured once locally. SCAN_MAX tracks the live max id.
+          SCAN_MIN: '6000'
+          SCAN_MAX: ${{ steps.window.outputs.scan_max }}
+          DS_DELAY_MS: '250'
+          WORLD_DELAY_MS: '250'
+
+      # Periodic block-colour refresh for the worlds with LIVE colours: sovereigns
+      # (owners re-theme, so colours change) + exos (a cheap backstop in case the
+      # 10-minute poll's colour capture for a new exo ever failed - exos are few).
+      # Permanent worlds are skipped: their colours are fixed and served from the
+      # static snapshot, so re-capturing them is wasted work + account load. The
+      # colour ingest skips the KV write when a world's colours are unchanged.
+      - name: Capture live block colours (sovereigns + exos)
+        working-directory: bot
+        continue-on-error: true
+        timeout-minutes: 15
+        run: npm run capture -- --non-perm
+        env:
+          STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
+          STEAM_PASSWORD: ${{ secrets.STEAM_PASSWORD }}
+          BOUNDLESS_USERNAME: ${{ secrets.BOUNDLESS_USERNAME }}
+          BOUNDLESS_PASSWORD: ${{ secrets.BOUNDLESS_PASSWORD }}
+          BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+
+      # Orbited ("closest") world + blinksec distance, only for worlds still MISSING one
+      # (distances are static, so distance-cli skips already-resolved worlds). Bounded by
+      # a per-step timeout + continue-on-error so a slow distance pass can never eat the
+      # job budget and starve the settlement/resource backstops that run after it.
+      - name: Capture orbited-world distances (missing only)
+        working-directory: bot
+        continue-on-error: true
+        timeout-minutes: 12
+        run: npm run distances
+        env:
+          STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
+          STEAM_PASSWORD: ${{ secrets.STEAM_PASSWORD }}
+          BOUNDLESS_USERNAME: ${{ secrets.BOUNDLESS_USERNAME }}
+          BOUNDLESS_PASSWORD: ${{ secrets.BOUNDLESS_PASSWORD }}
+          BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+
+      # Self-heal resource coverage: backfill any live world that still has no captured
+      # resources (legacy public sovereigns below the scan frontier, e.g. Hyrule). World
+      # resources are fixed at spawn, so once filled they persist and this becomes a
+      # no-op; the change-aware ingest skips the KV write when nothing changed.
+      - name: Detect live worlds missing resources
+        id: missing
+        run: node detect-missing-resources.mjs
+
+      - name: Backfill resources for worlds missing them
+        if: steps.missing.outputs.has_missing == 'true'
+        working-directory: bot
+        continue-on-error: true
+        timeout-minutes: 10
+        run: npm run run -- ${{ steps.missing.outputs.ids }}
+        env:
+          STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
+          STEAM_PASSWORD: ${{ secrets.STEAM_PASSWORD }}
+          BOUNDLESS_USERNAME: ${{ secrets.BOUNDLESS_USERNAME }}
+          BOUNDLESS_PASSWORD: ${{ secrets.BOUNDLESS_PASSWORD }}
+          BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+
+      # Refresh SETTLEMENTS for every perm + sovereign. Settlements (the prestige
+      # leaderboard) are dynamic, but the frontier scan above only covers the new-world
+      # id window, so permanents and older sovereigns kept stale settlements from the
+      # initial scan. Re-scanning them here picks up new/grown/abandoned settlements every
+      # 6h; resources are fixed so the change-aware ingest skips those writes.
+      - name: Detect perm + sovereign worlds (settlement refresh)
+        id: setworlds
+        run: node detect-settlement-worlds.mjs
+        env:
+          SCAN_MIN: '6000'
+          SCAN_MAX: ${{ steps.window.outputs.scan_max }}
+
+      - name: Refresh settlements for perms + sovereigns
+        if: steps.setworlds.outputs.has_worlds == 'true'
+        working-directory: bot
+        continue-on-error: true
+        timeout-minutes: 15
+        run: npm run run -- ${{ steps.setworlds.outputs.ids }}
+        env:
+          STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
+          STEAM_PASSWORD: ${{ secrets.STEAM_PASSWORD }}
+          BOUNDLESS_USERNAME: ${{ secrets.BOUNDLESS_USERNAME }}
+          BOUNDLESS_PASSWORD: ${{ secrets.BOUNDLESS_PASSWORD }}
+          BOUNDLESS_ACCOUNT_USERNAME: ${{ secrets.BOUNDLESS_ACCOUNT_USERNAME }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+
+      # --- Notify Telegram if any non-tolerated step above failed (best-effort, no-op if unset) ---
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            curl -sS -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+              -d chat_id="$TG_CHAT" \
+              --data-urlencode "text=Boundless cron FAILED: ${{ github.workflow }} (run #${{ github.run_number }}) ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
