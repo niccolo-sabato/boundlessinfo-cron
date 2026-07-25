@@ -68,33 +68,28 @@ async function main(): Promise<void> {
     ? shard
     : Math.floor(new Date().getUTCHours() / (24 / shards)) % shards;
 
-  // Items already proven non-tradeable (403). Skipping them keeps every sweep cheaper and
-  // is the mechanism that makes the catalogue self-maintaining.
-  let skipItems: number[] = [];
+  // Always loaded: "hot" scans exactly these keys, and "discover" uses them to visit
+  // already-trading worlds first (see captureShopping).
+  let active: Record<string, { S: number[]; B: number[] }> = {};
   try {
-    skipItems = (await getJson<{ items: number[] }>(`${config.apiBase}/api/v2/shopping/skip-items`)).items ?? [];
+    active = (
+      await getJson<{ worlds: Record<string, { S: number[]; B: number[] }> }>(
+        `${config.apiBase}/api/v2/shopping/active`,
+      )
+    ).worlds ?? {};
   } catch {
-    // Best-effort: without the list we simply re-learn the 403s during this run.
+    // Without it "hot" simply finds nothing and falls back to discovery below.
   }
-
-  let active: Record<string, { S: number[]; B: number[] }> | undefined;
   let effectiveMode = mode;
-  if (mode === "hot") {
-    const res = await getJson<{ worlds: Record<string, { S: number[]; B: number[] }> }>(
-      `${config.apiBase}/api/v2/shopping/active`,
-    );
-    active = res.worlds;
-    const pairs = Object.values(active).reduce((n, a) => n + a.S.length + a.B.length, 0);
-    if (pairs === 0) {
-      console.log("hot sweep: nothing known yet, falling back to a discovery sweep");
-      effectiveMode = "discover";
-    }
+  const pairs = Object.values(active).reduce((n, a) => n + a.S.length + a.B.length, 0);
+  if (mode === "hot" && pairs === 0) {
+    console.log("hot sweep: nothing known yet, falling back to a discovery sweep");
+    effectiveMode = "discover";
   }
 
   console.log(
     `worlds ${worlds.length} | items ${itemIds.length} | mode ${effectiveMode}` +
-      (effectiveMode === "discover" ? ` | shard ${effectiveShard}/${shards}` : "") +
-      (skipItems.length ? ` | skipping ${skipItems.length} non-tradeable items` : ""),
+      (effectiveMode === "discover" ? ` | shard ${effectiveShard}/${shards}` : ""),
   );
 
   // Open an audit row so a run that dies is still visible in the admin dashboard.
@@ -119,7 +114,6 @@ async function main(): Promise<void> {
       worlds,
       itemIds,
       active,
-      skipItems,
       shard: effectiveShard,
       shards,
     });
@@ -127,7 +121,7 @@ async function main(): Promise<void> {
     console.log(
       `done in ${mins} min: ${stats.requests} requests, ${stats.listings} listings seen, ` +
         `${stats.rowsWritten} rows written, ${stats.worldsDone} worlds, ${stats.errors} errors, ` +
-        `${stats.skippedItems} items marked not-tradeable` +
+        `${stats.throttled} throttled` +
         (stats.truncated ? " (time budget reached, remainder next run)" : ""),
     );
     note = stats.truncated ? "time budget reached" : "ok";

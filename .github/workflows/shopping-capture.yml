@@ -40,10 +40,12 @@ concurrency:
 env:
   BOUNDLESS_API_KEY: ${{ secrets.BOUNDLESS_API_KEY }}
   INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
-  # 16 worlds in parallel, strictly serial inside each world at ~1 request/second, which is
-  # exactly the documented per-game-server limit.
-  SHOP_WORLD_CONCURRENCY: '16'
-  SHOP_REQUEST_DELAY_MS: '1000'
+  # Throughput is capped by a GLOBAL pacer, not by parallelism: the binding official rule is
+  # "1 response per second for each api-key" across the whole universe. Rejections on cache
+  # misses are normal back-pressure (the server balancing us against other users) and do not
+  # fall if we go slower, so we pace just under the documented rate and retry.
+  SHOP_WORLD_CONCURRENCY: '1'
+  SHOP_PACE_MS: '1200'
   SHOP_SHARDS: '12'
 
 jobs:

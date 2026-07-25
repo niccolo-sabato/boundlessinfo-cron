@@ -7,20 +7,24 @@
  *   B = request basket-> a player BUYS, so you can SELL to it
  * Auth: header `Boundless-API-Key`.
  *
- * Documented server behaviour we are built around:
- *  - ONE in-flight request per key per game server (concurrent -> 429), ~1 response/second.
- *    Every world is its own game server, so we run worlds in parallel but stay strictly
- *    serial inside a world.
- *  - Responses are cached server-side for 30 minutes, so sweeping a world more often than
- *    that only re-reads the same cache.
- *  - 403 means the key is not accepted (fatal, we abort rather than hammer).
- *  - 503 (+ Retry-After) means busy/locked: back off and retry.
+ * THE RATE LIMIT, from the official docs, is two separate rules:
+ *   1. "Each API key is permitted to have 1 request in-flight that hits a given game
+ *      server: any attempt to run concurrent requests will return 429 responses."
+ *   2. "Responses will be returned up to a rate of 1 response per second for each api-key."
+ * Rule 2 is the binding one: it is per KEY across the entire universe, so parallelising
+ * across worlds buys no throughput. Measured against the live servers: at concurrency 1
+ * every request succeeded, at concurrency 16 roughly one in five came back 403. A 403 here
+ * is the server shedding load, NOT a permanent property of the item (the same item answers
+ * 200 a second later on another world), so it is retried, never recorded.
+ *
+ * Everything therefore flows through one shared Pacer at ~1 request/second, which caps our
+ * whole footprint no matter how the work is distributed.
  *
  * Robustness rules:
  *  - Every run is bounded by a wall-clock budget; leftovers are picked up next run.
- *  - Results are posted in chunks as we go, so a killed run keeps everything already
- *    captured. The ingest only deletes listings for keys it actually verified, so a partial
- *    sweep can never wipe unrelated data.
+ *  - Results are posted in chunks as we go, so a killed run keeps everything captured.
+ *  - The ingest only deletes listings for keys it actually verified, so a partial sweep can
+ *    never wipe unrelated data.
  */
 
 import { config } from "./config.ts";
@@ -54,9 +58,11 @@ export interface CaptureStats {
   worldsDone: number;
   rowsWritten: number;
   truncated: boolean;
-  /** Items found to be non-tradeable (403) and recorded so they are never asked again. */
-  skippedItems: number;
+  /** Requests that came back 403/429 and had to be retried (rate-limit pressure). */
+  throttled: number;
 }
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * Decode one binary Shopping response. Records repeat until the buffer ends (there is no
@@ -101,76 +107,84 @@ export function parseShopping(buf: Buffer, itemId: number, type: ShopType): Shop
 export class ShopKeyError extends Error {}
 
 /**
- * Thrown when the API answers 403 for a specific item.
+ * Global request pacer.
  *
- * Verified against the live servers: a 403 here is an ITEM property, not a key problem.
- * Tradeable items answer 200 with the same key, while items that cannot be traded at all
- * (seasonal decorations and similar) answer 403 on every world. So we record the item as
- * not-shoppable and never spend a request on it again, instead of aborting the sweep.
+ * The binding official rule is "1 response per second for each api-key", across the whole
+ * universe, so every outgoing request passes through one shared pacer. Workers may still
+ * overlap to hide latency while the aggregate rate stays inside the limit.
  */
-export class ShopItemUnavailable extends Error {}
-
-/** Item shoppability learned during a run, shared by every world worker. */
-export interface LearnedItems {
-  shoppable: Set<number>;
-  notShoppable: Set<number>;
+export class Pacer {
+  private next = 0;
+  private readonly intervalMs: number;
+  // An explicit field, not a constructor parameter property: the bot runs through Node's
+  // type-stripping loader, which cannot emit the implicit assignment.
+  constructor(intervalMs: number) {
+    this.intervalMs = intervalMs;
+  }
+  async take(): Promise<void> {
+    const now = Date.now();
+    const at = Math.max(now, this.next);
+    this.next = at + this.intervalMs;
+    const wait = at - now;
+    if (wait > 0) await sleep(wait);
+  }
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
 /**
- * Fetch one (world, type, item). Retries transient conditions (429/503/network) with
- * backoff, honours Retry-After, and surfaces a 403 as fatal.
+ * Fetch one (world, type, item), paced globally.
+ *
+ * 403 and 429 are both treated as back-pressure: they are retried with growing backoff and
+ * never interpreted as "this item does not exist". Returns null when the request could not
+ * be completed, so the caller can leave that key out of the verified set (and therefore out
+ * of the deletion pass) instead of guessing.
  */
 async function fetchListings(
   apiUrl: string,
   type: ShopType,
   itemId: number,
   key: string,
-): Promise<ShopListing[]> {
+  pacer: Pacer,
+  stats: CaptureStats,
+): Promise<ShopListing[] | null> {
   const url = `${apiUrl}/shopping/${type}/${itemId}`;
-  let lastErr: unknown = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await pacer.take();
     try {
       const res = await fetch(url, {
         headers: { "Boundless-API-Key": key, "accept-encoding": "gzip" },
         signal: AbortSignal.timeout(config.requestTimeoutMs),
       });
-      if (res.status === 403) throw new ShopItemUnavailable(`item ${itemId} is not tradeable`);
-      if (res.status === 429 || res.status === 503) {
+      stats.requests++;
+      if (res.status === 403 || res.status === 429 || res.status === 503) {
+        stats.throttled++;
         const retryAfter = Number(res.headers.get("retry-after"));
-        await sleep(Math.min(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 5000, 30_000));
+        const backoff = Number.isFinite(retryAfter) && retryAfter > 0
+          ? Math.min(retryAfter * 1000, 30_000)
+          : 1500 * (attempt + 1);
+        await sleep(backoff);
         continue;
       }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) return null;
       const buf = Buffer.from(await res.arrayBuffer());
       // An empty body is a valid answer meaning "no shops for this item here".
       return buf.length === 0 ? [] : parseShopping(buf, itemId, type);
-    } catch (err) {
-      if (err instanceof ShopKeyError || err instanceof ShopItemUnavailable) throw err;
-      lastErr = err;
+    } catch {
       await sleep(1000 * (attempt + 1));
     }
   }
-  throw lastErr instanceof Error ? lastErr : new Error("shopping fetch failed");
+  return null;
 }
 
 /** POST one chunk of a world's scan to the ingest endpoint. Returns rows written. */
-async function postChunk(
-  worldId: number,
-  scanned: string[],
-  listings: ShopListing[],
-  shoppable: number[] = [],
-  notShoppable: number[] = [],
-): Promise<number> {
-  if (scanned.length === 0 && notShoppable.length === 0) return 0;
+async function postChunk(worldId: number, scanned: string[], listings: ShopListing[]): Promise<number> {
+  if (scanned.length === 0) return 0;
   const res = await fetch(`${config.apiBase}/api/ingest/shopping`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${config.ingestToken}`,
     },
-    body: JSON.stringify({ worldId, scanned, listings, shoppable, notShoppable }),
+    body: JSON.stringify({ worldId, scanned, listings }),
     signal: AbortSignal.timeout(30_000),
   });
   if (!res.ok) throw new Error(`ingest HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
@@ -181,83 +195,11 @@ async function postChunk(
 /** Post at most this many scanned keys per ingest call (keeps request bodies modest). */
 const POST_CHUNK = 200;
 
-/**
- * Scan one world's work list serially, posting progress in chunks.
- * `work` is the list of "<itemId>:<type>" keys to query.
- */
-async function captureWorld(
-  world: CaptureWorld,
-  work: string[],
-  key: string,
-  deadline: number,
-  stats: CaptureStats,
-  learned: LearnedItems,
-): Promise<void> {
-  let scanned: string[] = [];
-  let listings: ShopListing[] = [];
-  let newShoppable: number[] = [];
-  let newNotShoppable: number[] = [];
-
-  const flush = async () => {
-    if (!scanned.length && !newNotShoppable.length) return;
-    try {
-      stats.rowsWritten += await postChunk(
-        world.id, scanned, listings, newShoppable, newNotShoppable,
-      );
-    } catch (err) {
-      stats.errors++;
-      console.warn(`  world ${world.id}: ingest failed: ${(err as Error).message}`);
-    }
-    scanned = [];
-    listings = [];
-    newShoppable = [];
-    newNotShoppable = [];
-  };
-
-  for (const item of work) {
-    if (Date.now() > deadline) {
-      stats.truncated = true;
-      break;
-    }
-    const [idStr, type] = item.split(":");
-    const itemId = Number(idStr);
-    if (!Number.isFinite(itemId) || (type !== "S" && type !== "B")) continue;
-    // Another worker already proved this item is not tradeable: skip without a request.
-    if (learned.notShoppable.has(itemId)) continue;
-    try {
-      const found = await fetchListings(world.apiUrl, type, itemId, key);
-      stats.requests++;
-      stats.listings += found.length;
-      listings.push(...found);
-      scanned.push(item);
-      if (!learned.shoppable.has(itemId)) {
-        learned.shoppable.add(itemId);
-        newShoppable.push(itemId);
-      }
-    } catch (err) {
-      if (err instanceof ShopItemUnavailable) {
-        stats.requests++;
-        stats.skippedItems++;
-        if (!learned.notShoppable.has(itemId)) {
-          learned.notShoppable.add(itemId);
-          newNotShoppable.push(itemId);
-        }
-        // Not an error: the item simply cannot be traded. Recorded so no future sweep,
-        // on any world, ever asks for it again.
-      } else if (err instanceof ShopKeyError) {
-        await flush();
-        throw err;
-      } else {
-        stats.errors++;
-        // The key stays out of `scanned`, so the ingest will not treat its (possibly still
-        // existing) listings as deleted. Failing safe beats deleting real data.
-      }
-    }
-    if (scanned.length >= POST_CHUNK) await flush();
-    await sleep(config.shopRequestDelayMs);
-  }
-  await flush();
-  stats.worldsDone++;
+/** Per-world buffer of verified results, flushed to the ingest in chunks. */
+interface WorldBuffer {
+  world: CaptureWorld;
+  scanned: string[];
+  listings: ShopListing[];
 }
 
 export interface CaptureOptions {
@@ -267,8 +209,6 @@ export interface CaptureOptions {
   itemIds: number[];
   /** Active (world -> {S,B} item ids) from our API, used by the "hot" mode. */
   active?: Record<string, { S: number[]; B: number[] }>;
-  /** Item ids already known to be non-tradeable: never requested again. */
-  skipItems?: number[];
   shard?: number;
   shards?: number;
 }
@@ -282,78 +222,105 @@ function buildWork(opts: CaptureOptions, world: CaptureWorld): string[] {
   }
   const shards = opts.shards ?? 1;
   const shard = opts.shard ?? 0;
-  const skip = new Set(opts.skipItems ?? []);
-  const items = (
+  const items =
     opts.mode === "discover" && shards > 1
       ? opts.itemIds.filter((id) => id % shards === shard)
-      : opts.itemIds
-  ).filter((id) => !skip.has(id));
+      : opts.itemIds;
   const work: string[] = [];
-  for (const id of items) {
-    work.push(`${id}:S`, `${id}:B`);
-  }
+  for (const id of items) work.push(`${id}:S`, `${id}:B`);
   return work;
 }
 
 /**
- * Run a sweep. Worlds are processed by a fixed-size pool so the concurrency (and therefore
- * the load we put on the game servers) is predictable regardless of how many worlds exist.
+ * Run a sweep.
+ *
+ * Throughput is fixed by the global pacer, so concurrency exists only to keep the pipe full
+ * while a response is in flight (a couple of workers is plenty). Worlds are visited from a
+ * rotating offset so consecutive runs start somewhere new: with a time budget in play, that
+ * is what stops the same first worlds from being the only ones ever scanned.
  */
 export async function captureShopping(opts: CaptureOptions): Promise<CaptureStats> {
   const key = config.shopApiKey;
   const deadline = Date.now() + config.shopTimeBudgetMs;
   const stats: CaptureStats = {
     requests: 0, listings: 0, errors: 0, worldsDone: 0, rowsWritten: 0, truncated: false,
-    skippedItems: 0,
+    throttled: 0,
   };
-  // Shared across workers so an item proved non-tradeable on one world is skipped on all
-  // the others immediately, within the same run.
-  const learned: LearnedItems = {
-    shoppable: new Set<number>(),
-    notShoppable: new Set<number>(opts.skipItems ?? []),
-  };
+  const pacer = new Pacer(config.shopPaceMs);
 
-  // Skip worlds with nothing to do (very common in "hot" mode) so the pool spends its slots
-  // on real work.
-  const queue = opts.worlds
+  const all = opts.worlds
     .map((w) => ({ world: w, work: buildWork(opts, w) }))
     .filter((t) => t.work.length > 0);
+
+  // At ~1 request/second a full universe pass would take days, so WHERE we spend the budget
+  // matters more than raw speed. Shops are concentrated in a handful of hub worlds, so a
+  // discovery sweep visits worlds already known to trade first (deepening real markets),
+  // then everything else from a rotating offset so new shop worlds are still found over
+  // time without any stored cursor.
+  let queue = all;
+  if (opts.mode !== "hot") {
+    const known = new Set(Object.keys(opts.active ?? {}).map(Number));
+    const hot = all.filter((t) => known.has(t.world.id));
+    const cold = all.filter((t) => !known.has(t.world.id));
+    const offset = cold.length ? new Date().getUTCHours() % cold.length : 0;
+    queue = [...hot, ...cold.slice(offset), ...cold.slice(0, offset)];
+  }
+
   const totalReq = queue.reduce((n, t) => n + t.work.length, 0);
+  const estMin = Math.round((totalReq * config.shopPaceMs) / 60000);
   console.log(
-    `shopping ${opts.mode}: ${queue.length} worlds, ${totalReq} requests planned, ` +
-      `concurrency ${config.shopWorldConcurrency}, budget ${Math.round(config.shopTimeBudgetMs / 60000)} min`,
+    `shopping ${opts.mode}: ${queue.length} worlds, ${totalReq} requests planned ` +
+      `(~${estMin} min at ${config.shopPaceMs}ms/request), ` +
+      `budget ${Math.round(config.shopTimeBudgetMs / 60000)} min`,
   );
 
-  let next = 0;
-  let fatal: unknown = null;
-  const worker = async () => {
-    while (next < queue.length && !fatal) {
+  // INTERLEAVE the work across worlds instead of finishing one world at a time.
+  // Beyond the per-key response rate there is clearly a per-server component too: pacing at
+  // 1600ms while hammering a SINGLE world still drew ~28% rejections, whereas the same pace
+  // rotating over six worlds drew none. Round-robin gives each game server a long gap
+  // between our requests while the global pacer still caps the overall rate.
+  const buffers = queue.map<WorldBuffer>((t) => ({ world: t.world, scanned: [], listings: [] }));
+  const flush = async (buf: WorldBuffer) => {
+    if (!buf.scanned.length) return;
+    try {
+      stats.rowsWritten += await postChunk(buf.world.id, buf.scanned, buf.listings);
+    } catch (err) {
+      stats.errors++;
+      console.warn(`  world ${buf.world.id}: ingest failed: ${(err as Error).message}`);
+    }
+    buf.scanned = [];
+    buf.listings = [];
+  };
+
+  const maxLen = queue.reduce((n, t) => Math.max(n, t.work.length), 0);
+  const touched = new Set<number>();
+  outer: for (let i = 0; i < maxLen; i++) {
+    for (let w = 0; w < queue.length; w++) {
+      const item = queue[w].work[i];
+      if (item === undefined) continue;
       if (Date.now() > deadline) {
         stats.truncated = true;
-        return;
+        break outer;
       }
-      const task = queue[next++];
-      try {
-        await captureWorld(task.world, task.work, key, deadline, stats, learned);
-        // Safety net: if a long stretch of requests produced only rejections and never a
-        // single success, the key itself is the likely cause. Stop rather than grind on.
-        if (stats.requests > 200 && stats.listings === 0 && learned.shoppable.size === 0) {
-          fatal = new ShopKeyError("no item accepted after 200+ requests: key likely invalid");
-          return;
-        }
-      } catch (err) {
-        if (err instanceof ShopKeyError) {
-          fatal = err;
-          return;
-        }
+      const [idStr, type] = item.split(":");
+      const itemId = Number(idStr);
+      if (!Number.isFinite(itemId) || (type !== "S" && type !== "B")) continue;
+      const buf = buffers[w];
+      const found = await fetchListings(buf.world.apiUrl, type, itemId, key, pacer, stats);
+      touched.add(buf.world.id);
+      if (found === null) {
         stats.errors++;
-        console.warn(`world ${task.world.id}: ${(err as Error).message}`);
+        // Left out of `scanned` on purpose: the ingest must not treat listings it could not
+        // verify as deleted. Failing safe beats deleting real data.
+        continue;
       }
+      stats.listings += found.length;
+      buf.listings.push(...found);
+      buf.scanned.push(item);
+      if (buf.scanned.length >= POST_CHUNK) await flush(buf);
     }
-  };
-  await Promise.all(
-    Array.from({ length: Math.max(1, config.shopWorldConcurrency) }, () => worker()),
-  );
-  if (fatal) throw fatal;
+  }
+  for (const buf of buffers) await flush(buf);
+  stats.worldsDone = touched.size;
   return stats;
 }

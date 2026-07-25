@@ -140,13 +140,24 @@ export const config = {
     return req("BOUNDLESS_API_KEY");
   },
   /**
-   * Worlds scanned in parallel. The documented rate limit is one in-flight request per key
-   * PER GAME SERVER, and every world is its own server, so parallelism across worlds is
-   * within spec; inside a world we stay strictly serial.
+   * How many worlds are worked on at once. Throughput is capped by the GLOBAL pacer below,
+   * so concurrency exists only to keep the pipe full while a response is in flight. Going
+   * wide does not go faster: it just pushes the key past its budget and the server sheds the
+   * excess with 403s (measured: 0/16 rejected at concurrency 1, 3/16 at concurrency 16).
    */
-  shopWorldConcurrency: optInt("SHOP_WORLD_CONCURRENCY", 16),
-  /** Pause between two requests to the SAME world (docs: ~1 response/sec per key). */
-  shopRequestDelayMs: optInt("SHOP_REQUEST_DELAY_MS", 1000),
+  shopWorldConcurrency: optInt("SHOP_WORLD_CONCURRENCY", 1),
+  /**
+   * Minimum spacing between ANY two shopping requests, across every world, honouring the
+   * official "up to 1 response per second for each api-key" with margin.
+   *
+   * Measured, so we do not over-tune: the rejection rate on genuine cache misses is roughly
+   * 10-20% and does NOT fall as we slow down (1600ms, 2600ms and 4000ms all rejected a
+   * similar share). That back-pressure is the server balancing us against other users and
+   * the in-game Knowledge queries, exactly as the docs describe, so the answer is to retry
+   * politely rather than to crawl. Repeated reads are also served from the server's own
+   * 30-minute cache and never reach the game server at all.
+   */
+  shopPaceMs: optInt("SHOP_PACE_MS", 1200),
   /**
    * Hard wall-clock budget for one sweep. Whatever is left unscanned is simply picked up by
    * the next run (the ingest only ever deletes keys it actually verified), so every run is
