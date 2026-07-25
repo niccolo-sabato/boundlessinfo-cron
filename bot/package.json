@@ -15,7 +15,8 @@
     "run": "node --experimental-strip-types src/index.ts",
     "poll-once": "node --experimental-strip-types src/index.ts",
     "capture": "node --experimental-strip-types src/capture-cli.ts",
-    "distances": "node --experimental-strip-types src/distance-cli.ts"
+    "distances": "node --experimental-strip-types src/distance-cli.ts",
+    "shopping": "node --experimental-strip-types src/shopping-cli.ts"
   },
   "dependencies": {
     "steam-user": "^5.2.0"

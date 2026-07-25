@@ -1,0 +1,118 @@
+# Shopping capture: scrapes the official HTTP Shopping API (blessed key) and ingests the
+# result into our D1 database, which powers the site's price search and price history.
+#
+# REQUIRES these repository secrets:
+#   BOUNDLESS_API_KEY  the blessed Live key (shopping scope), issued by the Boundless devs
+#   INGEST_TOKEN       same value as the Worker secret
+#   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID  (optional) failure alerts
+#
+# Every run does two bounded passes:
+#   1. HOT      re-checks only the (world,item,type) triples that already hold listings, so
+#               live prices stay fresh for a few thousand requests instead of ~285k.
+#   2. DISCOVER scans one rotating item shard across every world to find NEW listings. With
+#               12 shards and a 2-hourly schedule the whole catalogue is covered each day
+#               while no single run is ever unbounded.
+# Both passes stop at their time budget and simply continue next run: the ingest only
+# deletes listings for keys it actually verified, so an interrupted sweep is always safe.
+
+name: shopping-capture
+
+on:
+  schedule:
+    - cron: '23 */2 * * *' # every 2 hours, off the :00 mark
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Which pass to run (both = hot then discover)'
+        type: choice
+        options: [both, hot, discover, full]
+        default: both
+      shard:
+        description: 'Discovery shard override (blank = derived from the clock)'
+        default: ''
+
+concurrency:
+  # Never let two sweeps overlap: they would double the load we put on the game servers
+  # and race on the same D1 rows.
+  group: boundless-shopping
+  cancel-in-progress: false
+
+env:
+  BOUNDLESS_API_KEY: ${{ secrets.BOUNDLESS_API_KEY }}
+  INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+  # 16 worlds in parallel, strictly serial inside each world at ~1 request/second, which is
+  # exactly the documented per-game-server limit.
+  SHOP_WORLD_CONCURRENCY: '16'
+  SHOP_REQUEST_DELAY_MS: '1000'
+  SHOP_SHARDS: '12'
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install bot dependencies
+        working-directory: bot
+        # Retry transient registry errors (ECONNRESET etc.) so a network blip does not fail
+        # the sweep; only a persistent failure surfaces.
+        run: |
+          for i in 1 2 3; do
+            npm install --no-audit --no-fund --fetch-retries=5 --fetch-retry-maxtimeout=120000 && break
+            if [ "$i" -eq 3 ]; then echo "npm install failed after 3 attempts"; exit 1; fi
+            echo "npm install attempt $i failed (transient network); retrying in 15s..."
+            sleep 15
+          done
+
+      # --- 1. HOT: keep known listings fresh (cheap) ---
+      - name: Hot sweep (refresh known listings)
+        if: ${{ github.event.inputs.mode == '' || github.event.inputs.mode == 'both' || github.event.inputs.mode == 'hot' }}
+        working-directory: bot
+        env:
+          SHOP_TIME_BUDGET_MS: '1500000' # 25 min
+        run: npm run shopping -- --mode=hot
+
+      # --- 2. DISCOVER: find new listings, one rotating item shard across all worlds ---
+      - name: Discovery sweep (rotating item shard)
+        if: ${{ github.event.inputs.mode == '' || github.event.inputs.mode == 'both' || github.event.inputs.mode == 'discover' }}
+        working-directory: bot
+        env:
+          SHOP_TIME_BUDGET_MS: '3000000' # 50 min
+          SHOP_SHARD: ${{ github.event.inputs.shard }}
+        run: npm run shopping -- --mode=discover
+
+      # --- Manual full sweep (workflow_dispatch only): every item on every world ---
+      - name: Full sweep
+        if: ${{ github.event.inputs.mode == 'full' }}
+        working-directory: bot
+        env:
+          SHOP_TIME_BUDGET_MS: '5400000' # 90 min
+        run: npm run shopping -- --mode=full
+
+      # --- Snapshot today's weighted-average price bands (idempotent upsert) ---
+      - name: Roll up price history
+        if: ${{ always() && job.status != 'cancelled' }}
+        run: |
+          curl -sS -X POST "https://boundlessinfo-api.niccolo-sabato.workers.dev/api/ingest/shopping/rollup" \
+            -H "authorization: Bearer $INGEST_TOKEN" \
+            -H "content-type: application/json" \
+            -d '{}' | head -c 300
+          echo
+
+      # --- Notify Telegram if anything above failed (best-effort, no-op if unset) ---
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            curl -sS -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+              -d chat_id="$TG_CHAT" \
+              --data-urlencode "text=Boundless shopping capture FAILED: ${{ github.workflow }} (run #${{ github.run_number }}) ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi

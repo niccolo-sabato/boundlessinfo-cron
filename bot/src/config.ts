@@ -133,6 +133,31 @@ export const config = {
   worldDelayMs: optInt("WORLD_DELAY_MS", 1000),
   /** Per-request timeout. Boundlexx default 5s. */
   requestTimeoutMs: optInt("REQUEST_TIMEOUT_MS", 8000),
+
+  // --- Official HTTP Shopping API (blessed key issued by the Boundless devs) ---
+  /** Sent as the `Boundless-API-Key` header. Never logged, never committed. */
+  get shopApiKey() {
+    return req("BOUNDLESS_API_KEY");
+  },
+  /**
+   * Worlds scanned in parallel. The documented rate limit is one in-flight request per key
+   * PER GAME SERVER, and every world is its own server, so parallelism across worlds is
+   * within spec; inside a world we stay strictly serial.
+   */
+  shopWorldConcurrency: optInt("SHOP_WORLD_CONCURRENCY", 16),
+  /** Pause between two requests to the SAME world (docs: ~1 response/sec per key). */
+  shopRequestDelayMs: optInt("SHOP_REQUEST_DELAY_MS", 1000),
+  /**
+   * Hard wall-clock budget for one sweep. Whatever is left unscanned is simply picked up by
+   * the next run (the ingest only ever deletes keys it actually verified), so every run is
+   * bounded and an interrupted sweep can never corrupt the data.
+   */
+  shopTimeBudgetMs: optInt("SHOP_TIME_BUDGET_MS", 55 * 60 * 1000),
+  /**
+   * Discovery sweeps rotate through item shards (item_id % shards) so the whole catalogue is
+   * covered over a day (12 shards, one per 2-hourly run) without any single run being unbounded.
+   */
+  shopShards: optInt("SHOP_SHARDS", 12),
 } as const;
 
 /**
