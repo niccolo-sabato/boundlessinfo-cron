@@ -68,6 +68,15 @@ async function main(): Promise<void> {
     ? shard
     : Math.floor(new Date().getUTCHours() / (24 / shards)) % shards;
 
+  // Items already proven non-tradeable (403). Skipping them keeps every sweep cheaper and
+  // is the mechanism that makes the catalogue self-maintaining.
+  let skipItems: number[] = [];
+  try {
+    skipItems = (await getJson<{ items: number[] }>(`${config.apiBase}/api/v2/shopping/skip-items`)).items ?? [];
+  } catch {
+    // Best-effort: without the list we simply re-learn the 403s during this run.
+  }
+
   let active: Record<string, { S: number[]; B: number[] }> | undefined;
   let effectiveMode = mode;
   if (mode === "hot") {
@@ -84,7 +93,8 @@ async function main(): Promise<void> {
 
   console.log(
     `worlds ${worlds.length} | items ${itemIds.length} | mode ${effectiveMode}` +
-      (effectiveMode === "discover" ? ` | shard ${effectiveShard}/${shards}` : ""),
+      (effectiveMode === "discover" ? ` | shard ${effectiveShard}/${shards}` : "") +
+      (skipItems.length ? ` | skipping ${skipItems.length} non-tradeable items` : ""),
   );
 
   // Open an audit row so a run that dies is still visible in the admin dashboard.
@@ -109,13 +119,15 @@ async function main(): Promise<void> {
       worlds,
       itemIds,
       active,
+      skipItems,
       shard: effectiveShard,
       shards,
     });
     const mins = ((Date.now() - started) / 60000).toFixed(1);
     console.log(
       `done in ${mins} min: ${stats.requests} requests, ${stats.listings} listings seen, ` +
-        `${stats.rowsWritten} rows written, ${stats.worldsDone} worlds, ${stats.errors} errors` +
+        `${stats.rowsWritten} rows written, ${stats.worldsDone} worlds, ${stats.errors} errors, ` +
+        `${stats.skippedItems} items marked not-tradeable` +
         (stats.truncated ? " (time budget reached, remainder next run)" : ""),
     );
     note = stats.truncated ? "time budget reached" : "ok";

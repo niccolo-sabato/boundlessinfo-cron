@@ -54,6 +54,8 @@ export interface CaptureStats {
   worldsDone: number;
   rowsWritten: number;
   truncated: boolean;
+  /** Items found to be non-tradeable (403) and recorded so they are never asked again. */
+  skippedItems: number;
 }
 
 /**
@@ -98,6 +100,22 @@ export function parseShopping(buf: Buffer, itemId: number, type: ShopType): Shop
 /** Thrown when the key itself is rejected: retrying would just hammer the servers. */
 export class ShopKeyError extends Error {}
 
+/**
+ * Thrown when the API answers 403 for a specific item.
+ *
+ * Verified against the live servers: a 403 here is an ITEM property, not a key problem.
+ * Tradeable items answer 200 with the same key, while items that cannot be traded at all
+ * (seasonal decorations and similar) answer 403 on every world. So we record the item as
+ * not-shoppable and never spend a request on it again, instead of aborting the sweep.
+ */
+export class ShopItemUnavailable extends Error {}
+
+/** Item shoppability learned during a run, shared by every world worker. */
+export interface LearnedItems {
+  shoppable: Set<number>;
+  notShoppable: Set<number>;
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
@@ -118,7 +136,7 @@ async function fetchListings(
         headers: { "Boundless-API-Key": key, "accept-encoding": "gzip" },
         signal: AbortSignal.timeout(config.requestTimeoutMs),
       });
-      if (res.status === 403) throw new ShopKeyError(`403 for ${type}/${itemId} (key not accepted)`);
+      if (res.status === 403) throw new ShopItemUnavailable(`item ${itemId} is not tradeable`);
       if (res.status === 429 || res.status === 503) {
         const retryAfter = Number(res.headers.get("retry-after"));
         await sleep(Math.min(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 5000, 30_000));
@@ -129,7 +147,7 @@ async function fetchListings(
       // An empty body is a valid answer meaning "no shops for this item here".
       return buf.length === 0 ? [] : parseShopping(buf, itemId, type);
     } catch (err) {
-      if (err instanceof ShopKeyError) throw err;
+      if (err instanceof ShopKeyError || err instanceof ShopItemUnavailable) throw err;
       lastErr = err;
       await sleep(1000 * (attempt + 1));
     }
@@ -142,15 +160,17 @@ async function postChunk(
   worldId: number,
   scanned: string[],
   listings: ShopListing[],
+  shoppable: number[] = [],
+  notShoppable: number[] = [],
 ): Promise<number> {
-  if (scanned.length === 0) return 0;
+  if (scanned.length === 0 && notShoppable.length === 0) return 0;
   const res = await fetch(`${config.apiBase}/api/ingest/shopping`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${config.ingestToken}`,
     },
-    body: JSON.stringify({ worldId, scanned, listings }),
+    body: JSON.stringify({ worldId, scanned, listings, shoppable, notShoppable }),
     signal: AbortSignal.timeout(30_000),
   });
   if (!res.ok) throw new Error(`ingest HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
@@ -171,20 +191,27 @@ async function captureWorld(
   key: string,
   deadline: number,
   stats: CaptureStats,
+  learned: LearnedItems,
 ): Promise<void> {
   let scanned: string[] = [];
   let listings: ShopListing[] = [];
+  let newShoppable: number[] = [];
+  let newNotShoppable: number[] = [];
 
   const flush = async () => {
-    if (!scanned.length) return;
+    if (!scanned.length && !newNotShoppable.length) return;
     try {
-      stats.rowsWritten += await postChunk(world.id, scanned, listings);
+      stats.rowsWritten += await postChunk(
+        world.id, scanned, listings, newShoppable, newNotShoppable,
+      );
     } catch (err) {
       stats.errors++;
       console.warn(`  world ${world.id}: ingest failed: ${(err as Error).message}`);
     }
     scanned = [];
     listings = [];
+    newShoppable = [];
+    newNotShoppable = [];
   };
 
   for (const item of work) {
@@ -195,20 +222,36 @@ async function captureWorld(
     const [idStr, type] = item.split(":");
     const itemId = Number(idStr);
     if (!Number.isFinite(itemId) || (type !== "S" && type !== "B")) continue;
+    // Another worker already proved this item is not tradeable: skip without a request.
+    if (learned.notShoppable.has(itemId)) continue;
     try {
       const found = await fetchListings(world.apiUrl, type, itemId, key);
       stats.requests++;
       stats.listings += found.length;
       listings.push(...found);
       scanned.push(item);
+      if (!learned.shoppable.has(itemId)) {
+        learned.shoppable.add(itemId);
+        newShoppable.push(itemId);
+      }
     } catch (err) {
-      if (err instanceof ShopKeyError) {
+      if (err instanceof ShopItemUnavailable) {
+        stats.requests++;
+        stats.skippedItems++;
+        if (!learned.notShoppable.has(itemId)) {
+          learned.notShoppable.add(itemId);
+          newNotShoppable.push(itemId);
+        }
+        // Not an error: the item simply cannot be traded. Recorded so no future sweep,
+        // on any world, ever asks for it again.
+      } else if (err instanceof ShopKeyError) {
         await flush();
         throw err;
+      } else {
+        stats.errors++;
+        // The key stays out of `scanned`, so the ingest will not treat its (possibly still
+        // existing) listings as deleted. Failing safe beats deleting real data.
       }
-      stats.errors++;
-      // The key stays out of `scanned`, so the ingest will not treat its (possibly still
-      // existing) listings as deleted. Failing safe beats deleting real data.
     }
     if (scanned.length >= POST_CHUNK) await flush();
     await sleep(config.shopRequestDelayMs);
@@ -224,6 +267,8 @@ export interface CaptureOptions {
   itemIds: number[];
   /** Active (world -> {S,B} item ids) from our API, used by the "hot" mode. */
   active?: Record<string, { S: number[]; B: number[] }>;
+  /** Item ids already known to be non-tradeable: never requested again. */
+  skipItems?: number[];
   shard?: number;
   shards?: number;
 }
@@ -237,10 +282,12 @@ function buildWork(opts: CaptureOptions, world: CaptureWorld): string[] {
   }
   const shards = opts.shards ?? 1;
   const shard = opts.shard ?? 0;
-  const items =
+  const skip = new Set(opts.skipItems ?? []);
+  const items = (
     opts.mode === "discover" && shards > 1
       ? opts.itemIds.filter((id) => id % shards === shard)
-      : opts.itemIds;
+      : opts.itemIds
+  ).filter((id) => !skip.has(id));
   const work: string[] = [];
   for (const id of items) {
     work.push(`${id}:S`, `${id}:B`);
@@ -257,6 +304,13 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
   const deadline = Date.now() + config.shopTimeBudgetMs;
   const stats: CaptureStats = {
     requests: 0, listings: 0, errors: 0, worldsDone: 0, rowsWritten: 0, truncated: false,
+    skippedItems: 0,
+  };
+  // Shared across workers so an item proved non-tradeable on one world is skipped on all
+  // the others immediately, within the same run.
+  const learned: LearnedItems = {
+    shoppable: new Set<number>(),
+    notShoppable: new Set<number>(opts.skipItems ?? []),
   };
 
   // Skip worlds with nothing to do (very common in "hot" mode) so the pool spends its slots
@@ -280,7 +334,13 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
       }
       const task = queue[next++];
       try {
-        await captureWorld(task.world, task.work, key, deadline, stats);
+        await captureWorld(task.world, task.work, key, deadline, stats, learned);
+        // Safety net: if a long stretch of requests produced only rejections and never a
+        // single success, the key itself is the likely cause. Stop rather than grind on.
+        if (stats.requests > 200 && stats.listings === 0 && learned.shoppable.size === 0) {
+          fatal = new ShopKeyError("no item accepted after 200+ requests: key likely invalid");
+          return;
+        }
       } catch (err) {
         if (err instanceof ShopKeyError) {
           fatal = err;
