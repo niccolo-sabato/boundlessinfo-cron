@@ -176,6 +176,46 @@ minimum in blinksecs. Results are POSTed to `${API_BASE}/api/ingest-distances`.
 - Same region is preferred (blink space is per-region); falls back to all perms
   if a region has none.
 
+### Shop prices (`shopping`)
+
+Uses a **blessed API key** issued by the Boundless developers, not the player account. Route
+is `<worldApiURL>/shopping/{S|B}/{itemId}`, answering a compact binary record list.
+
+The rate limit is the whole design. Two official rules apply: one in-flight request per key
+per game server (429), and **one response per second per api-key across the entire universe**.
+The second binds, so parallelism buys nothing, and everything flows through one shared pacer.
+Measured against the live servers: 0 of 16 requests rejected at concurrency 1, 3 of 16 at
+concurrency 16. Rejections on genuine cache misses run 10-20% and **do not fall if you slow
+down**, because the server is balancing us against other users and the in-game Knowledge
+queries. Retry politely; do not crawl.
+
+**A 403 here is back-pressure, never a fact about the item.** An earlier version treated it as
+"this item cannot be traded" and blacklisted 108 items; the same items answered 200 seconds
+later on another world. Worlds are also visited round-robin rather than one at a time, because
+hammering a single world drew ~28% rejections at a pace that drew none when rotating.
+
+### Planet maps (`maps`)
+
+Uses a **second, different blessed key** on `<worldApiURL>/lod0`, which returns a GZIP TGA of
+the whole planet surface at one pixel per block. The response deliberately takes **9 to 13
+minutes** (measured: 12.3 on a standard world) because the server paces it so the request
+cannot disturb play.
+
+`src/image.ts` decodes the TGA and encodes the PNGs itself, with no dependencies, because no
+maintained pure-JS library reads TGA and the alternatives were a native dependency that has to
+build on both Windows and CI, or requiring ImageMagick on every machine. Three sizes are
+stored per world: full resolution, a 1024px overview for the viewer's opening view, and a
+256px thumbnail for the index grid.
+
+**The free 2020 mirror at `maps.playboundless.com` is deliberately not used.** It was measured
+before being trusted and it shows planets that no longer exist: a live capture of Gellis and
+the mirror's `euc3_t0_2` are different terrain, agreeing only at chance under all eight
+rotations, flips and transposes, and our capture matches no frozen image of that size under
+any name. The permanent worlds were regenerated after 2020.
+
+The block-to-pixel mapping is `px = x + size/2`, `py = z + size/2`, no flip and no transpose,
+proven on live terrain by `npm run diag-map-origin`.
+
 ### Ingest body shape (`/api/ingest/worlds`)
 
 ```jsonc
@@ -226,6 +266,10 @@ world. `owner` is a number for sovereigns (including private), null otherwise.
 | `npm run distances [ids...]` | Compute the closest permanent world per sovereign/exo via DS `/distance` and POST to `/api/ingest-distances`. Optional ids restrict the targets. |
 | `npm run diag` | Probe `/gameserver` with several candidate path usernames to confirm which one the DS accepts. Uses the cached token (no Steam login). |
 | `npm run diag-poll` | Probe `/worldpoll` with several candidate username encodings to confirm the packed-struct username form. Refetches a fresh pollData per attempt. |
+| `npm run shopping` | Capture shop prices from the official HTTP Shopping API. `-- --mode=hot` re-checks only known listings, `--mode=discover` rotates an item shard across every world, `--rollup` also snapshots the day's price bands. Needs `BOUNDLESS_API_KEY`. |
+| `npm run maps` | Capture planet maps from the official LOD0 API. `-- --mode=refresh` also re-captures stale ones, `--worlds=36` targets specific ids, `--dry-run` prints the plan and stops. Backfills any missing thumbnails first, from images already stored. Needs `BOUNDLESS_API_KEY_LOD0`. |
+| `npm run diag-image` | Prove the home-grown image codec against real bytes: synthetic TGA round-trips (both RLE forms, both origins, gzipped and not), a PNG round-trip, and a real 4608x4608 map decoded, re-encoded and downscaled. |
+| `npm run diag-map-origin` | Prove the block-to-pixel mapping on live terrain. Scores every known shop position on a real capture under four candidate orientations. The right one wins by roughly 2x the random baseline; the others sit at 1.0. |
 
 Two more diagnostics exist as source files (no npm script; run with
 `node --experimental-strip-types src/<file>.ts`):
@@ -255,6 +299,10 @@ Names only (see `.env.example` for inline notes):
 | `SCAN_MIN`, `SCAN_MAX` | Inclusive world-id range to probe each `run` (defaults 1..5000). |
 | `SPIKE_WORLD_ID` | A single known-live world id for `npm run spike` (also the default target for `diag*`). |
 | `DS_DELAY_MS`, `WORLD_DELAY_MS`, `REQUEST_TIMEOUT_MS` | Optional politeness delays / timeout (defaults 1000 / 1000 / 8000 ms). |
+| `BOUNDLESS_API_KEY` | Blessed key for the official HTTP Shopping API, issued by the Boundless developers. |
+| `BOUNDLESS_API_KEY_LOD0` | Blessed key for the LOD0 planet-map API. A DIFFERENT key from the shopping one. |
+| `SHOP_PACE_MS`, `SHOP_SHARDS`, `SHOP_TIME_BUDGET_MS` | Shopping capture tuning (defaults 1200 ms between any two requests, 12 shards, 55 min). |
+| `MAP_TIME_BUDGET_MS`, `MAP_MAX_PER_RUN`, `MAP_REFRESH_DAYS`, `MAP_OVERVIEW_PX`, `MAP_THUMB_PX` | Map capture tuning (defaults 55 min, 30 worlds, 30 days, 1024 px, 256 px). |
 
 Optional debug flags (env, not in `.env.example`): `STEAM_DEBUG=1`,
 `CAPTURE_DEBUG=1` add verbose logging.
