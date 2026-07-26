@@ -25,7 +25,7 @@
  */
 
 import { config } from "./config.ts";
-import { decodeTga, downscale, encodePng, type Raster } from "./image.ts";
+import { decodePng, decodeTga, downscale, encodePng, type Raster } from "./image.ts";
 import { gunzipSync } from "node:zlib";
 
 export interface MapWorld {
@@ -53,7 +53,7 @@ export interface MapCaptureOptions {
   mode: "new" | "refresh";
   worlds: MapWorld[];
   /** world id -> what we already hold, from /api/v2/maps/coverage. */
-  coverage: Record<string, { at: number; source: string }>;
+  coverage: Record<string, { at: number; source: string; thumb?: boolean }>;
   /** World ids known to have shops. Maps exist to make shops findable, so these come first. */
   shopWorlds: Set<number>;
   /** Stop before starting another world once this many are done. */
@@ -103,7 +103,11 @@ async function fetchLod0(world: MapWorld): Promise<Raster> {
 
 /* ----------------------------- Upload ----------------------------- */
 
-async function putBlob(worldId: number, variant: "full" | "overview", png: Buffer): Promise<number> {
+async function putBlob(
+  worldId: number,
+  variant: "full" | "overview" | "thumb",
+  png: Buffer,
+): Promise<number> {
   const res = await fetch(`${config.apiBase}/api/ingest/map/blob?world=${worldId}&variant=${variant}`, {
     method: "POST",
     headers: { "content-type": "image/png", authorization: `Bearer ${config.ingestToken}` },
@@ -223,13 +227,18 @@ export async function captureMaps(opts: MapCaptureOptions): Promise<MapCaptureSt
 
       const fullPng = encodePng(img);
       const overviewPng = encodePng(downscale(img, config.mapOverviewPx));
+      // A third, tiny size for the index grid. Reusing the 1024px overview there would make
+      // one page pull tens of megabytes to draw pictures 190 pixels wide.
+      const thumbPng = encodePng(downscale(img, config.mapThumbPx));
       console.log(
         `  encoded: full ${(fullPng.length / 1048576).toFixed(2)} MB, ` +
-          `overview ${(overviewPng.length / 1024).toFixed(0)} KB`,
+          `overview ${(overviewPng.length / 1024).toFixed(0)} KB, ` +
+          `thumb ${(thumbPng.length / 1024).toFixed(0)} KB`,
       );
 
       stats.bytesWritten += await putBlob(world.id, "full", fullPng);
       stats.bytesWritten += await putBlob(world.id, "overview", overviewPng);
+      stats.bytesWritten += await putBlob(world.id, "thumb", thumbPng);
       await putRecord({
         world_id: world.id,
         internal_name: world.name,
@@ -241,6 +250,7 @@ export async function captureMaps(opts: MapCaptureOptions): Promise<MapCaptureSt
         source_ref: "",
         bytes_full: fullPng.length,
         bytes_overview: overviewPng.length,
+        bytes_thumb: thumbPng.length,
         captured_at: Math.floor(Date.now() / 1000),
         took_ms: Date.now() - started,
       });
@@ -259,4 +269,69 @@ export async function captureMaps(opts: MapCaptureOptions): Promise<MapCaptureSt
   }
 
   return stats;
+}
+
+/* ----------------------------- Thumbnail backfill ----------------------------- */
+
+interface StoredMap {
+  world_id: number;
+  internal_name: string;
+  display_name: string;
+  size_blocks: number;
+  width: number;
+  height: number;
+  source: "lod0" | "cdn";
+  source_ref: string;
+  bytes_full: number;
+  bytes_overview: number;
+  bytes_thumb: number | null;
+  captured_at: number;
+  took_ms: number;
+}
+
+/**
+ * Give already-captured worlds their missing thumbnail.
+ *
+ * Crucially this does NOT go back to the game servers: it downloads the full-resolution PNG we
+ * already stored, downscales it and uploads the small one. A LOD0 capture costs twelve minutes
+ * of a world server's time; re-fetching two dozen worlds just to produce a smaller copy of
+ * something we already hold would be both slow and rude.
+ *
+ * The index row is re-sent in full, read back from the API rather than reconstructed, because
+ * the upsert replaces every column: inventing the byte counts here would corrupt the totals
+ * the storage cap is computed from.
+ */
+export async function backfillThumbs(
+  worldIds: number[],
+): Promise<{ done: number; skipped: number; errors: number; bytes: number }> {
+  const out = { done: 0, skipped: 0, errors: 0, bytes: 0 };
+  for (const id of worldIds) {
+    try {
+      const recRes = await fetch(`${config.apiBase}/api/v2/maps/${id}`, {
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!recRes.ok) throw new Error(`record -> HTTP ${recRes.status}`);
+      const rec = (await recRes.json()) as StoredMap;
+      if (rec.bytes_thumb !== null) {
+        out.skipped++;
+        continue;
+      }
+
+      const imgRes = await fetch(`${config.apiBase}/maps/${id}/full.png?v=${rec.captured_at}`, {
+        signal: AbortSignal.timeout(180_000),
+      });
+      if (!imgRes.ok) throw new Error(`full.png -> HTTP ${imgRes.status}`);
+      const img = decodePng(Buffer.from(await imgRes.arrayBuffer()));
+      const thumbPng = encodePng(downscale(img, config.mapThumbPx));
+
+      out.bytes += await putBlob(id, "thumb", thumbPng);
+      await putRecord({ ...rec, bytes_thumb: thumbPng.length });
+      out.done++;
+      console.log(`  ${rec.display_name}: thumb ${(thumbPng.length / 1024).toFixed(0)} KB`);
+    } catch (err) {
+      out.errors++;
+      console.warn(`  world ${id}: ${(err as Error).message}`);
+    }
+  }
+  return out;
 }

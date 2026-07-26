@@ -189,8 +189,14 @@ export const config = {
    * would burn a run, not a bucket.
    */
   mapMaxPerRun: optInt("MAP_MAX_PER_RUN", 30),
-  /** Longest side of the downscaled overview image served for the initial view. */
+  /** Longest side of the downscaled overview image served for the viewer's opening view. */
   mapOverviewPx: optInt("MAP_OVERVIEW_PX", 1024),
+  /**
+   * Longest side of the thumbnail used on the maps index. The overview is about a megabyte,
+   * which is right for a viewer and badly wrong for a grid of a hundred tiles drawn 190
+   * pixels wide, so the index gets its own much smaller image.
+   */
+  mapThumbPx: optInt("MAP_THUMB_PX", 256),
   /**
    * How old a map may get before a run is allowed to spend its budget refreshing it. Terrain
    * only changes where players build, so a month is generous; new worlds always come first.

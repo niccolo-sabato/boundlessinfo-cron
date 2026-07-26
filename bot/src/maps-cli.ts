@@ -13,7 +13,7 @@
  */
 
 import { config } from "./config.ts";
-import { captureMaps, planMapWork, type MapWorld } from "./maps.ts";
+import { backfillThumbs, captureMaps, planMapWork, type MapWorld } from "./maps.ts";
 
 function arg(name: string): string | undefined {
   const hit = process.argv.slice(2).find((a) => a.startsWith(`--${name}=`));
@@ -78,6 +78,19 @@ async function main(): Promise<void> {
   }
 
   const opts = { mode, worlds, coverage: cov.worlds, shopWorlds, maxWorlds };
+
+  // Thumbnails arrived after the first captures. Backfilling them re-uses the images we
+  // already stored rather than asking the game servers again, so it costs seconds a world
+  // instead of twelve minutes, and it runs before any capture so a short run still fixes the
+  // index. Once every map has one this is a no-op.
+  const missingThumbs = Object.entries(cov.worlds)
+    .filter(([, v]) => v.thumb === false)
+    .map(([id]) => Number(id));
+  if (missingThumbs.length && !hasFlag("dry-run")) {
+    console.log(`\nbackfilling ${missingThumbs.length} missing thumbnails from stored images`);
+    const r = await backfillThumbs(missingThumbs);
+    console.log(`  ${r.done} written, ${r.skipped} already had one, ${r.errors} errors\n`);
+  }
 
   if (hasFlag("dry-run")) {
     const jobs = planMapWork(opts);
