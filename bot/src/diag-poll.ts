@@ -48,7 +48,7 @@ async function main() {
   console.log("character name:", JSON.stringify(token.player.name), "| id:", token.player.id);
 
   const accountU = token.username; // ExampleUser
-  const charU = token.player.name; // ExamplePlayer
+  const charU = token.player.name; // Kanjiro
 
   // [label, username, contentType?]
   const candidates: [string, string, string | null][] = [

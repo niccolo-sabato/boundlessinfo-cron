@@ -16,7 +16,10 @@
     "poll-once": "node --experimental-strip-types src/index.ts",
     "capture": "node --experimental-strip-types src/capture-cli.ts",
     "distances": "node --experimental-strip-types src/distance-cli.ts",
-    "shopping": "node --experimental-strip-types src/shopping-cli.ts"
+    "shopping": "node --experimental-strip-types src/shopping-cli.ts",
+    "maps": "node --experimental-strip-types src/maps-cli.ts",
+    "diag-image": "node --experimental-strip-types src/diag-image.ts",
+    "diag-map-origin": "node --experimental-strip-types src/diag-map-origin.ts"
   },
   "dependencies": {
     "steam-user": "^5.2.0"

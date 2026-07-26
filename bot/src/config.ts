@@ -169,6 +169,45 @@ export const config = {
    * covered over a day (12 shards, one per 2-hourly run) without any single run being unbounded.
    */
   shopShards: optInt("SHOP_SHARDS", 12),
+
+  // --- Official HTTP LOD0 Map API (a SEPARATE blessed key from the shopping one) ---
+  /** Sent as the `Boundless-API-Key` header on `<apiURL>/lod0`. Never logged, never committed. */
+  get mapApiKey() {
+    return req("BOUNDLESS_API_KEY_LOD0");
+  },
+  /**
+   * The free Wonderstruck map mirror, `maps.playboundless.com/<date>/<internalName>.png`.
+   * The date directories are frozen: this is the newest one that exists. Those images are
+   * from 2020, so they are a no-cost baseline for permanent worlds rather than current
+   * truth; anything that matters gets regenerated from LOD0.
+   */
+  mapCdnDate: process.env.MAP_CDN_DATE ?? "2020-06-14",
+  /**
+   * A LOD0 response takes 9-10 minutes by design (the server paces itself so the request
+   * cannot disturb the world), so the timeout has to be generous or we would abandon
+   * perfectly good captures.
+   */
+  mapRequestTimeoutMs: optInt("MAP_REQUEST_TIMEOUT_MS", 25 * 60 * 1000),
+  /** Wall-clock budget for one sweep. Whatever is left is simply picked up next run. */
+  mapTimeBudgetMs: optInt("MAP_TIME_BUDGET_MS", 55 * 60 * 1000),
+  /**
+   * Belt to the Worker's braces: the storage cap is enforced server-side, but the bot also
+   * refuses to attempt more than this many worlds in a run. A capture loop that went wrong
+   * would burn a run, not a bucket.
+   */
+  mapMaxPerRun: optInt("MAP_MAX_PER_RUN", 30),
+  /** Longest side of the downscaled overview image served for the initial view. */
+  mapOverviewPx: optInt("MAP_OVERVIEW_PX", 1024),
+  /**
+   * How old a map may get before a run is allowed to spend its budget refreshing it. Terrain
+   * only changes where players build, so a month is generous; new worlds always come first.
+   */
+  mapRefreshDays: optInt("MAP_REFRESH_DAYS", 30),
+  /**
+   * Refuse absurd worlds outright. A side of 8192 blocks is already 67 megapixels and about
+   * 200 MB per working buffer; anything beyond that is a data error, not a planet.
+   */
+  mapMaxSideBlocks: optInt("MAP_MAX_SIDE_BLOCKS", 8192),
 } as const;
 
 /**

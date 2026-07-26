@@ -1,0 +1,122 @@
+# Planet map capture: turns worlds into stored images at 1 pixel per block, which is what
+# lets the site show WHERE a shop actually is instead of only that it exists.
+#
+# REQUIRES these repository secrets:
+#   BOUNDLESS_API_KEY_LOD0  the blessed Live key with the lod0maps scope (a DIFFERENT key
+#                           from the shopping one), issued by the Boundless devs
+#   INGEST_TOKEN            same value as the Worker secret
+#   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID  (optional) failure alerts
+#
+# Why this is its own workflow rather than a step inside shopping-capture: one LOD0 response
+# takes 9 to 10 minutes by design (the world server paces itself so the request cannot disturb
+# play), so a map run is long and sparse while a shopping run is short and dense. Keeping them
+# apart means a slow map capture can never eat the budget that keeps prices fresh.
+#
+# Two modes, exactly like the shopping capture:
+#   cdn   lifts the frozen 2020 images off the free public mirror. No key, no waiting, and it
+#         gives every permanent world a picture within a single short run.
+#   lod0  generates current maps from the game servers. Slow, so it works through a priority
+#         queue: worlds with shops and no map first, then worlds with no map, then the 2020
+#         images being upgraded, then whatever has gone stale.
+#
+# STORAGE IS CAPPED IN CODE. The ingest endpoint refuses an upload that would push us past a
+# self-imposed ceiling (200 worlds / 3 GiB, against an R2 free tier of 10 GB) and the run
+# stops with a non-zero exit so this workflow alerts. The billing alert on the account only
+# warns after the fact; this is the part that actually prevents a bill.
+
+name: map-capture
+
+on:
+  schedule:
+    # Twice a day, off the hour. A run maps a handful of worlds; the queue drains over days,
+    # which is fine because the images are only refreshed monthly once captured.
+    - cron: '41 3,15 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'cdn = free frozen images, lod0 = generate current maps, auto = both'
+        type: choice
+        options: [auto, cdn, lod0]
+        default: auto
+      worlds:
+        description: 'Comma-separated world ids (blank = the planner decides)'
+        default: ''
+      max:
+        description: 'Maximum worlds this run may capture'
+        default: ''
+      dry_run:
+        description: 'Print the plan and stop'
+        type: boolean
+        default: false
+
+concurrency:
+  # Two map runs at once would queue behind each other on the same world servers and race on
+  # the same R2 objects.
+  group: boundless-maps
+  cancel-in-progress: false
+
+env:
+  BOUNDLESS_API_KEY_LOD0: ${{ secrets.BOUNDLESS_API_KEY_LOD0 }}
+  INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install bot dependencies
+        working-directory: bot
+        # Retry transient registry errors (ECONNRESET etc.) so a network blip does not fail
+        # the run; only a persistent failure surfaces.
+        run: |
+          for i in 1 2 3; do
+            npm install --no-audit --no-fund --fetch-retries=5 --fetch-retry-maxtimeout=120000 && break
+            if [ "$i" -eq 3 ]; then echo "npm install failed after 3 attempts"; exit 1; fi
+            echo "npm install attempt $i failed (transient network); retrying in 15s..."
+            sleep 15
+          done
+
+      # --- 1. CDN: give every permanent world a baseline image. Fast, no key, no waiting. ---
+      - name: Baseline sweep (free frozen images)
+        if: ${{ github.event.inputs.dry_run != 'true' && (github.event.inputs.mode == '' || github.event.inputs.mode == 'auto' || github.event.inputs.mode == 'cdn') }}
+        working-directory: bot
+        env:
+          MAP_TIME_BUDGET_MS: '1800000' # 30 min
+        run: npm run maps -- --mode=cdn ${{ github.event.inputs.worlds && format('--worlds={0}', github.event.inputs.worlds) || '' }} ${{ github.event.inputs.max && format('--max={0}', github.event.inputs.max) || '' }}
+
+      # --- 2. LOD0: current terrain, roughly 10 minutes per world. ---
+      # A larger images-per-run number would not help: the wall clock, not the cap, is the
+      # limit here. Four hours of budget is about twenty worlds at the documented pace.
+      - name: Live sweep (generate current maps)
+        if: ${{ github.event.inputs.dry_run != 'true' && (github.event.inputs.mode == '' || github.event.inputs.mode == 'auto' || github.event.inputs.mode == 'lod0') }}
+        working-directory: bot
+        env:
+          MAP_TIME_BUDGET_MS: '14400000' # 4 hours
+        run: npm run maps -- --mode=lod0 ${{ github.event.inputs.worlds && format('--worlds={0}', github.event.inputs.worlds) || '' }} ${{ github.event.inputs.max && format('--max={0}', github.event.inputs.max) || '' }}
+
+      # --- Plan only (workflow_dispatch): show what a run WOULD do, capture nothing. ---
+      - name: Show the plan
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        working-directory: bot
+        run: npm run maps -- --dry-run --mode=${{ github.event.inputs.mode || 'auto' }}
+
+      # --- Notify Telegram if anything above failed (best-effort, no-op if unset) ---
+      # Note this also fires when the storage cap stops a run, which is exactly when the
+      # owner needs to know: it means maps have to be pruned or the ceiling reconsidered.
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            curl -sS -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+              -d chat_id="$TG_CHAT" \
+              --data-urlencode "text=Boundless map capture FAILED (or hit the storage cap): ${{ github.workflow }} (run #${{ github.run_number }}) ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
