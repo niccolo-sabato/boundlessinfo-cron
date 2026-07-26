@@ -8,16 +8,18 @@
 #   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID  (optional) failure alerts
 #
 # Why this is its own workflow rather than a step inside shopping-capture: one LOD0 response
-# takes 9 to 10 minutes by design (the world server paces itself so the request cannot disturb
-# play), so a map run is long and sparse while a shopping run is short and dense. Keeping them
-# apart means a slow map capture can never eat the budget that keeps prices fresh.
+# takes 9 to 13 minutes by design (the world server paces itself so the request cannot disturb
+# play), so a map run is long and sparse while a shopping run is short and dense. Separating
+# them means a slow capture can never eat the budget that keeps prices fresh.
 #
-# Two modes, exactly like the shopping capture:
-#   cdn   lifts the frozen 2020 images off the free public mirror. No key, no waiting, and it
-#         gives every permanent world a picture within a single short run.
-#   lod0  generates current maps from the game servers. Slow, so it works through a priority
-#         queue: worlds with shops and no map first, then worlds with no map, then the 2020
-#         images being upgraded, then whatever has gone stale.
+# The free 2020 mirror at maps.playboundless.com is deliberately NOT used. It was measured:
+# today's terrain does not match it under any transform, and no frozen image matches our
+# capture under any name, because the permanent worlds were regenerated after 2020. A map of
+# a planet that no longer exists would put every shop marker on meaningless ground.
+#
+# Two modes. 'new' only maps worlds we hold nothing for, which is what drains the backlog.
+# 'refresh' additionally re-captures maps older than MAP_REFRESH_DAYS, so player building
+# eventually shows up.
 #
 # STORAGE IS CAPPED IN CODE. The ingest endpoint refuses an upload that would push us past a
 # self-imposed ceiling (200 worlds / 3 GiB, against an R2 free tier of 10 GB) and the run
@@ -28,16 +30,17 @@ name: map-capture
 
 on:
   schedule:
-    # Twice a day, off the hour. A run maps a handful of worlds; the queue drains over days,
-    # which is fine because the images are only refreshed monthly once captured.
+    # Twice a day, off the hour. At roughly twelve minutes a world, a five-hour run covers
+    # about twenty worlds, so the whole universe is mapped within a few days and refreshes
+    # comfortably inside a month afterwards.
     - cron: '41 3,15 * * *'
   workflow_dispatch:
     inputs:
       mode:
-        description: 'cdn = free frozen images, lod0 = generate current maps, auto = both'
+        description: 'new = only unmapped worlds, refresh = also re-capture stale maps'
         type: choice
-        options: [auto, cdn, lod0]
-        default: auto
+        options: [new, refresh]
+        default: new
       worlds:
         description: 'Comma-separated world ids (blank = the planner decides)'
         default: ''
@@ -62,7 +65,9 @@ env:
 jobs:
   capture:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    # The hosted-runner ceiling is 6 hours; the capture stops itself at 5 so the summary and
+    # the audit row are always written.
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -82,33 +87,22 @@ jobs:
             sleep 15
           done
 
-      # --- 1. CDN: give every permanent world a baseline image. Fast, no key, no waiting. ---
-      - name: Baseline sweep (free frozen images)
-        if: ${{ github.event.inputs.dry_run != 'true' && (github.event.inputs.mode == '' || github.event.inputs.mode == 'auto' || github.event.inputs.mode == 'cdn') }}
+      - name: Capture maps
+        if: ${{ github.event.inputs.dry_run != 'true' }}
         working-directory: bot
         env:
-          MAP_TIME_BUDGET_MS: '1800000' # 30 min
-        run: npm run maps -- --mode=cdn ${{ github.event.inputs.worlds && format('--worlds={0}', github.event.inputs.worlds) || '' }} ${{ github.event.inputs.max && format('--max={0}', github.event.inputs.max) || '' }}
-
-      # --- 2. LOD0: current terrain, roughly 10 minutes per world. ---
-      # A larger images-per-run number would not help: the wall clock, not the cap, is the
-      # limit here. Four hours of budget is about twenty worlds at the documented pace.
-      - name: Live sweep (generate current maps)
-        if: ${{ github.event.inputs.dry_run != 'true' && (github.event.inputs.mode == '' || github.event.inputs.mode == 'auto' || github.event.inputs.mode == 'lod0') }}
-        working-directory: bot
-        env:
-          MAP_TIME_BUDGET_MS: '14400000' # 4 hours
-        run: npm run maps -- --mode=lod0 ${{ github.event.inputs.worlds && format('--worlds={0}', github.event.inputs.worlds) || '' }} ${{ github.event.inputs.max && format('--max={0}', github.event.inputs.max) || '' }}
+          MAP_TIME_BUDGET_MS: '18000000' # 5 hours
+        run: npm run maps -- --mode=${{ github.event.inputs.mode || 'new' }} ${{ github.event.inputs.worlds && format('--worlds={0}', github.event.inputs.worlds) || '' }} ${{ github.event.inputs.max && format('--max={0}', github.event.inputs.max) || '' }}
 
       # --- Plan only (workflow_dispatch): show what a run WOULD do, capture nothing. ---
       - name: Show the plan
         if: ${{ github.event.inputs.dry_run == 'true' }}
         working-directory: bot
-        run: npm run maps -- --dry-run --mode=${{ github.event.inputs.mode || 'auto' }}
+        run: npm run maps -- --dry-run --mode=${{ github.event.inputs.mode || 'new' }}
 
       # --- Notify Telegram if anything above failed (best-effort, no-op if unset) ---
-      # Note this also fires when the storage cap stops a run, which is exactly when the
-      # owner needs to know: it means maps have to be pruned or the ceiling reconsidered.
+      # This also fires when the storage cap stops a run, which is exactly when the owner
+      # needs to know: it means maps must be pruned or the ceiling reconsidered.
       - name: Notify Telegram on failure
         if: failure()
         env:

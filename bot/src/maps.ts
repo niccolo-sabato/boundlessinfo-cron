@@ -1,31 +1,36 @@
 /**
  * Planet map capture: turns a world into a stored image, 1 pixel per block.
  *
- * Two sources, deliberately:
+ * ONE source: `<apiURL>/lod0` with the blessed key. The response is a GZIP TGA streamed back
+ * over 9 to 13 minutes, because the server paces itself so the request cannot disturb play.
+ * That slowness is why capture starts early and runs unattended while the rest of the release
+ * is being built.
  *
- *  - **LOD0** (`<apiURL>/lod0`, blessed key): the current world, GZIP TGA, streamed back over
- *    9 to 10 minutes because the server paces itself so the request cannot disturb play. This
- *    is the real source. It is also the slow one, which is why capture runs early and often
- *    while everything else is being built.
- *  - **The free CDN** (`maps.playboundless.com/<date>/<internal>.png`): the same 1px/block
- *    image, no key, no wait, but frozen in 2020. Good enough to give a permanent world a
- *    baseline picture immediately, and it costs neither key budget nor ten minutes. Every
- *    CDN map is eventually replaced by a LOD0 one.
+ * WHY NOT THE FREE MIRROR. `maps.playboundless.com/<date>/<internal>.png` is public, needs no
+ * key and answers in seconds, and the plan was to use it as an instant baseline for permanent
+ * worlds. It was measured before being trusted, and it fails: today's Gellis and the mirror's
+ * `euc3_t0_2` are different terrain. Their coastlines do not line up under any rotation, flip
+ * or transpose (water-mask agreement sits at chance, about 17%, for all eight), and comparing
+ * our capture against EVERY frozen image of the same size found no match anywhere, so it is
+ * not a naming drift either. The mirror's newest directory is 2020-06-14 and the permanent
+ * worlds were regenerated since. A map of a planet that no longer exists would put every shop
+ * marker on meaningless ground, which is worse for a player trying to reach a shop than
+ * showing no map at all. It is therefore not used at any priority, and not as a fallback.
  *
  * The politeness rules are the shopping ones: one request at a time, honour `Retry-After`,
  * bound the run by wall-clock time and let the remainder wait for the next run.
  *
- * The storage cap is enforced by the ingest endpoint (which is where it cannot be bypassed),
+ * The storage cap is enforced by the ingest endpoint, which is where it cannot be bypassed,
  * and mirrored here so a run stops early rather than making a doomed round trip per world.
  */
 
 import { config } from "./config.ts";
-import { decodePng, decodeTga, downscale, encodePng, type Raster } from "./image.ts";
+import { decodeTga, downscale, encodePng, type Raster } from "./image.ts";
 import { gunzipSync } from "node:zlib";
 
 export interface MapWorld {
   id: number;
-  /** Internal name, e.g. "euc3_t0_2". Also the file name on the free CDN. */
+  /** Internal name, e.g. "euc3_t0_2". */
   name: string;
   displayName: string;
   /** World side in CHUNKS; a block is 1/16th of a chunk on each axis. */
@@ -38,15 +43,14 @@ export interface MapCaptureStats {
   worldsDone: number;
   bytesWritten: number;
   errors: number;
-  skipped: number;
   truncated: boolean;
   /** Set when the server refused an upload because the storage cap was reached. */
   capped: boolean;
 }
 
 export interface MapCaptureOptions {
-  /** 'cdn' takes the free frozen images; 'lod0' generates current ones; 'auto' does both. */
-  mode: "cdn" | "lod0" | "auto";
+  /** 'new' only maps worlds we hold nothing for; 'refresh' also re-captures stale ones. */
+  mode: "new" | "refresh";
   worlds: MapWorld[];
   /** world id -> what we already hold, from /api/v2/maps/coverage. */
   coverage: Record<string, { at: number; source: string }>;
@@ -61,7 +65,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Thrown when the storage cap was hit: the run ends, it does not retry. */
 export class MapCapError extends Error {}
 
-/* ----------------------------- Sources ----------------------------- */
+/* ----------------------------- Source ----------------------------- */
 
 /**
  * Fetch and decode a world's current map from the game server.
@@ -87,37 +91,25 @@ async function fetchLod0(world: MapWorld): Promise<Raster> {
     }
     if (res.status === 403) throw new Error("LOD0 key rejected (403)");
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const gz = Buffer.from(await res.arrayBuffer());
-    if (gz.length === 0) throw new Error("empty response");
-    // The endpoint advertises GZIP, but fetch transparently decompresses when the server
-    // also sets Content-Encoding, so accept either and let the magic bytes decide.
-    const tga = gz[0] === 0x1f && gz[1] === 0x8b ? gunzipSync(gz) : gz;
+    const body = Buffer.from(await res.arrayBuffer());
+    if (body.length === 0) throw new Error("empty response");
+    // The endpoint advertises GZIP, but fetch transparently decompresses when the server also
+    // sets Content-Encoding, so accept either and let the magic bytes decide.
+    const tga = body[0] === 0x1f && body[1] === 0x8b ? gunzipSync(body) : body;
     return decodeTga(tga);
   }
   throw new Error("world stayed busy across every attempt");
 }
 
-/** Fetch the frozen 2020 image, if one exists for this world. Returns null when it does not. */
-async function fetchCdn(world: MapWorld): Promise<Raster | null> {
-  const url = `https://maps.playboundless.com/${config.mapCdnDate}/${world.name}.png`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(180_000) });
-  if (res.status === 404 || res.status === 403) return null;
-  if (!res.ok) throw new Error(`CDN HTTP ${res.status}`);
-  return decodePng(Buffer.from(await res.arrayBuffer()));
-}
-
 /* ----------------------------- Upload ----------------------------- */
 
 async function putBlob(worldId: number, variant: "full" | "overview", png: Buffer): Promise<number> {
-  const res = await fetch(
-    `${config.apiBase}/api/ingest/map/blob?world=${worldId}&variant=${variant}`,
-    {
-      method: "POST",
-      headers: { "content-type": "image/png", authorization: `Bearer ${config.ingestToken}` },
-      body: png,
-      signal: AbortSignal.timeout(180_000),
-    },
-  );
+  const res = await fetch(`${config.apiBase}/api/ingest/map/blob?world=${worldId}&variant=${variant}`, {
+    method: "POST",
+    headers: { "content-type": "image/png", authorization: `Bearer ${config.ingestToken}` },
+    body: png,
+    signal: AbortSignal.timeout(180_000),
+  });
   if (res.status === 507) {
     const body = (await res.json().catch(() => ({}))) as { detail?: string };
     throw new MapCapError(`storage cap reached: ${body.detail ?? "no detail"}`);
@@ -138,9 +130,8 @@ async function putRecord(rec: Record<string, unknown>): Promise<void> {
 
 /* ----------------------------- Planning ----------------------------- */
 
-interface Job {
+export interface Job {
   world: MapWorld;
-  source: "lod0" | "cdn";
   /** Lower sorts first. */
   priority: number;
   why: string;
@@ -149,12 +140,12 @@ interface Job {
 /**
  * Decide what this run should spend its time on.
  *
- * The ordering is the whole point, because a run only gets through a handful of LOD0 worlds:
- *   1. Worlds with shops and no map at all. This is what the release actually needs.
- *   2. Any other world with no map.
- *   3. Worlds whose only map is a frozen 2020 CDN image, upgraded to a current one.
- *   4. Worlds whose LOD0 map has gone stale.
- * Sovereign and exo worlds never had a 2020 image, so for them LOD0 is the only option.
+ * The ordering is the whole point, because a capture costs about twelve minutes and one run
+ * only gets through a dozen or two:
+ *   1. Worlds that have shops and no map at all. That is exactly what the release needs.
+ *   2. Any other world with no map, permanent ones first: they are where players mostly
+ *      trade, and unlike sovereigns and exos they never expire.
+ *   3. Worlds whose map has gone stale, oldest first, and only in 'refresh' mode.
  */
 export function planMapWork(opts: MapCaptureOptions): Job[] {
   const now = Math.floor(Date.now() / 1000);
@@ -164,26 +155,21 @@ export function planMapWork(opts: MapCaptureOptions): Job[] {
   for (const w of opts.worlds) {
     const side = w.worldSize * 16;
     if (!Number.isFinite(side) || side <= 0 || side > config.mapMaxSideBlocks) continue;
+    if (!w.apiUrl) continue; // no world server to ask
     const held = opts.coverage[String(w.id)];
     const hasShops = opts.shopWorlds.has(w.id);
-    const canCdn = w.isPerm; // only worlds that existed in 2020 have a frozen image
-    const canLod0 = Boolean(w.apiUrl);
 
     if (!held) {
-      // Nothing at all: take whichever source the mode allows, cheapest first.
-      if (opts.mode !== "lod0" && canCdn) {
-        jobs.push({ world: w, source: "cdn", priority: hasShops ? 0 : 2, why: "no map yet" });
-      } else if (opts.mode !== "cdn" && canLod0) {
-        jobs.push({ world: w, source: "lod0", priority: hasShops ? 1 : 3, why: "no map yet" });
-      }
+      jobs.push({ world: w, priority: hasShops ? 0 : w.isPerm ? 1 : 2, why: "no map yet" });
       continue;
     }
-    if (opts.mode === "cdn") continue; // a CDN sweep never revisits a world it already covered
-    if (!canLod0) continue;
-    if (held.source === "cdn") {
-      jobs.push({ world: w, source: "lod0", priority: hasShops ? 4 : 6, why: "upgrading the 2020 image" });
-    } else if (now - held.at > staleAfter) {
-      jobs.push({ world: w, source: "lod0", priority: hasShops ? 5 : 7, why: `${Math.round((now - held.at) / 86400)} days old` });
+    if (opts.mode !== "refresh") continue;
+    if (now - held.at > staleAfter) {
+      jobs.push({
+        world: w,
+        priority: hasShops ? 3 : 4,
+        why: `${Math.round((now - held.at) / 86400)} days old`,
+      });
     }
   }
 
@@ -202,35 +188,34 @@ export function planMapWork(opts: MapCaptureOptions): Job[] {
 export async function captureMaps(opts: MapCaptureOptions): Promise<MapCaptureStats> {
   const deadline = Date.now() + config.mapTimeBudgetMs;
   const stats: MapCaptureStats = {
-    worldsDone: 0, bytesWritten: 0, errors: 0, skipped: 0, truncated: false, capped: false,
+    worldsDone: 0, bytesWritten: 0, errors: 0, truncated: false, capped: false,
   };
 
   const jobs = planMapWork(opts).slice(0, opts.maxWorlds);
-  console.log(`map capture ${opts.mode}: ${jobs.length} worlds planned, budget ${Math.round(config.mapTimeBudgetMs / 60000)} min`);
-  for (const j of jobs) console.log(`  - ${j.world.displayName} via ${j.source} (${j.why})`);
+  console.log(
+    `map capture ${opts.mode}: ${jobs.length} worlds planned, ` +
+      `budget ${Math.round(config.mapTimeBudgetMs / 60000)} min`,
+  );
+  for (const j of jobs) console.log(`  - ${j.world.displayName} (${j.why})`);
 
   for (const job of jobs) {
-    if (Date.now() > deadline) {
+    // Checked before starting rather than after: there is no point beginning a capture that
+    // takes twelve minutes when only two are left.
+    if (Date.now() + config.mapRequestTimeoutMs / 3 > deadline) {
       stats.truncated = true;
-      console.log("time budget reached, the rest waits for the next run");
+      console.log("\nnot enough time left for another world, the rest waits for the next run");
       break;
     }
     const { world } = job;
     const side = world.worldSize * 16;
     const started = Date.now();
-    console.log(`\n${world.displayName} (${world.name}) via ${job.source}, expecting ${side}x${side}`);
+    console.log(`\n${world.displayName} (${world.name}), expecting ${side}x${side}`);
 
     try {
-      const img = job.source === "lod0" ? await fetchLod0(world) : await fetchCdn(world);
-      if (!img) {
-        // Only reachable on the CDN path, and only when the frozen mirror has no such file.
-        console.log("  no image at that source, skipping");
-        stats.skipped++;
-        continue;
-      }
+      const img = await fetchLod0(world);
       if (img.width !== side || img.height !== side) {
-        // A mismatch means the block/pixel mapping we draw markers with would be wrong, and a
-        // map that puts shops in the wrong place is worse than no map at all.
+        // A mismatch means the block-to-pixel mapping we draw markers with would be wrong, and
+        // a map that puts shops in the wrong place is worse than no map at all.
         console.log(`  ! got ${img.width}x${img.height} but the world is ${side} blocks: refusing it`);
         stats.errors++;
         continue;
@@ -252,8 +237,8 @@ export async function captureMaps(opts: MapCaptureOptions): Promise<MapCaptureSt
         size_blocks: side,
         width: img.width,
         height: img.height,
-        source: job.source,
-        source_ref: job.source === "cdn" ? config.mapCdnDate : "",
+        source: "lod0",
+        source_ref: "",
         bytes_full: fullPng.length,
         bytes_overview: overviewPng.length,
         captured_at: Math.floor(Date.now() / 1000),

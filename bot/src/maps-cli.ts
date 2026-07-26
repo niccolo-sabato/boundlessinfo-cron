@@ -1,17 +1,15 @@
 /**
  * Planet map capture CLI.
  *
- *   npm run maps                        # mode from MAP_MODE (default: auto)
- *   npm run maps -- --mode=cdn          # free frozen images only: fast, no key, no waiting
- *   npm run maps -- --mode=lod0         # generate current maps from the game servers (slow)
- *   npm run maps -- --worlds=36 --mode=lod0   # one world, for testing
- *   npm run maps -- --dry-run           # print the plan and stop
+ *   npm run maps                       # mode from MAP_MODE (default: new)
+ *   npm run maps -- --mode=refresh     # also re-capture maps that have gone stale
+ *   npm run maps -- --worlds=36        # one world, for testing
+ *   npm run maps -- --dry-run          # print the plan and stop
  *
- * The two modes complement each other exactly as the shopping modes do: "cdn" gives every
- * permanent world a picture within one short run, while "lod0" spends its whole budget
- * replacing those with current terrain and covering the sovereign and exo worlds the frozen
- * mirror never had. Both are bounded by wall-clock time, so an interrupted run simply leaves
- * work for the next one.
+ * Every map costs about twelve minutes (the world server paces the response on purpose), so
+ * a run is bounded by wall clock and simply leaves the rest for the next one. Priority is
+ * what matters: worlds that have shops and no map come first, because the whole point of the
+ * maps is to make a shop reachable.
  */
 
 import { config } from "./config.ts";
@@ -39,8 +37,8 @@ interface WorldRow {
 }
 
 async function main(): Promise<void> {
-  const mode = (arg("mode") ?? process.env.MAP_MODE ?? "auto") as "cdn" | "lod0" | "auto";
-  if (!["cdn", "lod0", "auto"].includes(mode)) throw new Error(`unknown mode ${mode}`);
+  const mode = (arg("mode") ?? process.env.MAP_MODE ?? "new") as "new" | "refresh";
+  if (!["new", "refresh"].includes(mode)) throw new Error(`unknown mode ${mode}`);
   const worldFilter = arg("worlds")?.split(",").map(Number).filter(Number.isFinite);
   const maxWorlds = Number(arg("max") ?? config.mapMaxPerRun);
 
@@ -65,7 +63,7 @@ async function main(): Promise<void> {
       `${(cov.budget.bytes / 1048576).toFixed(0)} MB of ${(cov.budget.capBytes / 1048576).toFixed(0)} MB allowed`,
   );
   if (cov.budget.full) {
-    // The cap is a deliberate stop, so it is reported as a clean exit rather than an error.
+    // Reaching the cap is a deliberate stop, so it is reported as such rather than as a crash.
     console.log("storage cap reached: nothing will be captured until maps are pruned or the cap is raised");
     return;
   }
@@ -83,9 +81,9 @@ async function main(): Promise<void> {
 
   if (hasFlag("dry-run")) {
     const jobs = planMapWork(opts);
-    console.log(`\nplan (${jobs.length} worlds, would take the first ${maxWorlds}):`);
+    console.log(`\nplan (${jobs.length} worlds, this run would take the first ${maxWorlds}):`);
     for (const [i, j] of jobs.entries()) {
-      console.log(`  ${String(i + 1).padStart(3)}. ${j.world.displayName.padEnd(20)} ${j.source.padEnd(5)} ${j.why}`);
+      console.log(`  ${String(i + 1).padStart(3)}. ${j.world.displayName.padEnd(22)} ${j.why}`);
     }
     return;
   }
@@ -108,7 +106,7 @@ async function main(): Promise<void> {
   const mins = ((Date.now() - started) / 60000).toFixed(1);
   console.log(
     `\ndone in ${mins} min: ${stats.worldsDone} worlds mapped, ` +
-      `${(stats.bytesWritten / 1048576).toFixed(1)} MB written, ${stats.skipped} skipped, ${stats.errors} errors` +
+      `${(stats.bytesWritten / 1048576).toFixed(1)} MB written, ${stats.errors} errors` +
       (stats.capped ? " (STOPPED: storage cap)" : "") +
       (stats.truncated ? " (time budget reached, remainder next run)" : ""),
   );
@@ -126,8 +124,29 @@ async function main(): Promise<void> {
     }).catch(() => {});
   }
 
-  // A capture that stopped on the cap is a condition the owner should see in the job status,
-  // not something to swallow: exit non-zero so the workflow alerts.
+  // Sovereign and exo worlds expire. Their maps would otherwise sit in the bucket forever,
+  // spending the budget that live worlds need, so every run hands over the current world list
+  // and lets the server drop whatever is no longer in it. The server refuses to act on an
+  // implausibly short list, and this is skipped outright when the run was filtered to a few
+  // worlds, because that list is not the universe.
+  if (!worldFilter?.length) {
+    try {
+      const res = await fetch(`${config.apiBase}/api/ingest/map/prune`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${config.ingestToken}` },
+        body: JSON.stringify({ live: worldRows.map((w) => w.id) }),
+        signal: AbortSignal.timeout(60_000),
+      });
+      const out = (await res.json()) as { pruned?: number[]; skipped?: string };
+      if (out.skipped) console.log(`prune skipped: ${out.skipped}`);
+      else if (out.pruned?.length) console.log(`pruned ${out.pruned.length} maps of worlds that have left the universe`);
+    } catch (err) {
+      console.warn(`prune failed (harmless, retried next run): ${(err as Error).message}`);
+    }
+  }
+
+  // Hitting the cap is a condition the owner should see in the job status rather than
+  // something to swallow: exit non-zero so the workflow's alert fires.
   if (stats.capped) process.exitCode = 1;
 }
 

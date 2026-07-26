@@ -176,13 +176,6 @@ export const config = {
     return req("BOUNDLESS_API_KEY_LOD0");
   },
   /**
-   * The free Wonderstruck map mirror, `maps.playboundless.com/<date>/<internalName>.png`.
-   * The date directories are frozen: this is the newest one that exists. Those images are
-   * from 2020, so they are a no-cost baseline for permanent worlds rather than current
-   * truth; anything that matters gets regenerated from LOD0.
-   */
-  mapCdnDate: process.env.MAP_CDN_DATE ?? "2020-06-14",
-  /**
    * A LOD0 response takes 9-10 minutes by design (the server paces itself so the request
    * cannot disturb the world), so the timeout has to be generous or we would abandon
    * perfectly good captures.
