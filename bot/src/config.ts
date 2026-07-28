@@ -207,6 +207,18 @@ export const config = {
    * 200 MB per working buffer; anything beyond that is a data error, not a planet.
    */
   mapMaxSideBlocks: optInt("MAP_MAX_SIDE_BLOCKS", 8192),
+
+  // --- Official HTTP Beacons API (same blessed key as LOD0, NOT the shopping one) ---
+  /**
+   * Beacons answers in about 15 seconds for a busy world, nothing like LOD0's twelve minutes,
+   * so the whole universe fits in one sweep. The timeout is generous anyway: the response is
+   * chunked and a megabyte of plot map has to come down with it.
+   */
+  beaconTimeoutMs: optInt("BEACON_TIMEOUT_MS", 120_000),
+  /** Pause between worlds. The docs enforce no fair-use here; this is politeness, not a limit. */
+  beaconDelayMs: optInt("BEACON_DELAY_MS", 750),
+  /** Wall-clock budget for one sweep; leftovers are picked up next run. */
+  beaconTimeBudgetMs: optInt("BEACON_TIME_BUDGET_MS", 50 * 60 * 1000),
 } as const;
 
 /**

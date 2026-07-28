@@ -19,7 +19,9 @@
     "shopping": "node --experimental-strip-types src/shopping-cli.ts",
     "maps": "node --experimental-strip-types src/maps-cli.ts",
     "diag-image": "node --experimental-strip-types src/diag-image.ts",
-    "diag-map-origin": "node --experimental-strip-types src/diag-map-origin.ts"
+    "diag-map-origin": "node --experimental-strip-types src/diag-map-origin.ts",
+    "beacons": "node --experimental-strip-types src/beacons-cli.ts",
+    "diag-beacons": "node --experimental-strip-types src/diag-beacons.ts"
   },
   "dependencies": {
     "steam-user": "^5.2.0"

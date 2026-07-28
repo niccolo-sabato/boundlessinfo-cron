@@ -1,0 +1,86 @@
+# Beacon capture: every beacon on every world, and the settlements they form.
+#
+# REQUIRES these repository secrets:
+#   BOUNDLESS_API_KEY_LOD0  the blessed Live key. The SAME key as the map capture: beacons and
+#                           lod0 share a scope, which is the geography half of what the devs
+#                           issued. It is NOT the shopping key, which answers 403 here.
+#   INGEST_TOKEN            same value as the Worker secret
+#   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID  (optional) failure alerts
+#
+# WHY THIS EXISTS. The other source of settlement data is the authenticated world poll, and its
+# leaderboard returns only the top FIVE per world. A player asking why their settlement was
+# missing had to be told it was an API limitation, which was true of that endpoint. This one
+# returns everything: on Gellis, 268 beacons instead of 5 settlements.
+#
+# Unlike the map capture this is fast, about 15 seconds a world, so there is no queue and no
+# priority order: one run sweeps the whole universe in well under an hour. Prestige moves only
+# when someone builds, so daily is plenty.
+#
+# The ingest is diff-based, so a sweep where nothing changed writes almost nothing and the D1
+# free tier (about 100k row-writes a day) is never in danger.
+
+name: beacons-capture
+
+on:
+  schedule:
+    # Daily, offset from the map capture so the two never compete for the same world servers.
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+    inputs:
+      worlds:
+        description: 'Comma-separated world ids (blank = every live world)'
+        default: ''
+      dry_run:
+        description: 'Fetch and summarise, ingest nothing'
+        type: boolean
+        default: false
+
+concurrency:
+  group: boundless-beacons
+  cancel-in-progress: false
+
+env:
+  BOUNDLESS_API_KEY_LOD0: ${{ secrets.BOUNDLESS_API_KEY_LOD0 }}
+  INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install bot dependencies
+        working-directory: bot
+        # Retry transient registry errors (ECONNRESET etc.) so a network blip does not fail the
+        # run; only a persistent failure surfaces.
+        run: |
+          for i in 1 2 3; do
+            npm install --no-audit --no-fund --fetch-retries=5 --fetch-retry-maxtimeout=120000 && break
+            if [ "$i" -eq 3 ]; then echo "npm install failed after 3 attempts"; exit 1; fi
+            echo "npm install attempt $i failed (transient network); retrying in 15s..."
+            sleep 15
+          done
+
+      - name: Capture beacons
+        working-directory: bot
+        env:
+          BEACON_TIME_BUDGET_MS: '3000000' # 50 min
+        run: npm run beacons -- ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }} ${{ github.event.inputs.worlds && format('--worlds={0}', github.event.inputs.worlds) || '' }}
+
+      # --- Notify Telegram if the run failed (best-effort, no-op if unset) ---
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            curl -sS -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+              -d chat_id="$TG_CHAT" \
+              --data-urlencode "text=Boundless beacon capture FAILED: ${{ github.workflow }} (run #${{ github.run_number }}) ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
