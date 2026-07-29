@@ -8,17 +8,32 @@
  * Auth: header `Boundless-API-Key`.
  *
  * THE RATE LIMIT, from the official docs, is two separate rules:
- *   1. "Each API key is permitted to have 1 request in-flight that hits a given game
- *      server: any attempt to run concurrent requests will return 429 responses."
+ *   1. "Each API key is permitted to have 1 request in-flight that hits a GIVEN GAME SERVER:
+ *      any attempt to run concurrent requests will return 429 responses."
  *   2. "Responses will be returned up to a rate of 1 response per second for each api-key."
- * Rule 2 is the binding one: it is per KEY across the entire universe, so parallelising
- * across worlds buys no throughput. Measured against the live servers: at concurrency 1
- * every request succeeded, at concurrency 16 roughly one in five came back 403. A 403 here
- * is the server shedding load, NOT a permanent property of the item (the same item answers
- * 200 a second later on another world), so it is retried, never recorded.
  *
- * Everything therefore flows through one shared Pacer at ~1 request/second, which caps our
- * whole footprint no matter how the work is distributed.
+ * I originally read rule 2 as a hard global cap and built everything around one shared pacer
+ * at a request a second. THAT WAS WRONG, and it cost the site most of its catalogue: after
+ * days of capturing we held 156 items of 1136.
+ *
+ * What gave it away was BUTT, which reads the same API: its mirror holds the entire 995-item
+ * catalogue captured inside a 6.6 hour window, which needs roughly twelve successful responses
+ * a second. So I measured the thing I should have measured the first time, which is SUCCESSFUL
+ * RESPONSES PER SECOND rather than the rejection rate:
+ *
+ *   concurrency  1 ->  1.53 good responses/sec
+ *   concurrency  4 ->  8.62
+ *   concurrency  8 -> 18.29
+ *   concurrency 16 -> 25.32
+ *
+ * Roughly half of all requests are shed at EVERY level, including concurrency 1, so the
+ * rejections were never caused by going wide: that is just the server balancing us against
+ * other users on a cache miss, exactly as the docs describe. The earlier conclusion looked at
+ * that 50% and stopped, when the throughput underneath it scales almost linearly.
+ *
+ * So the capture now runs ONE REQUEST IN FLIGHT PER WORLD, across many worlds at once, which
+ * is precisely what rule 1 permits. A 403 is still back-pressure and never a fact about the
+ * item, so it is retried and never recorded.
  *
  * Robustness rules:
  *  - Every run is bounded by a wall-clock budget; leftovers are picked up next run.
@@ -107,11 +122,11 @@ export function parseShopping(buf: Buffer, itemId: number, type: ShopType): Shop
 export class ShopKeyError extends Error {}
 
 /**
- * Global request pacer.
+ * Spacing between requests.
  *
- * The binding official rule is "1 response per second for each api-key", across the whole
- * universe, so every outgoing request passes through one shared pacer. Workers may still
- * overlap to hide latency while the aggregate rate stays inside the limit.
+ * Now a politeness floor rather than the design constraint it used to be: throughput comes
+ * from running one request per world across many worlds, and this only stops any single
+ * worker from hammering. Kept shared so the total footprint still has a ceiling.
  */
 export class Pacer {
   private next = 0;
@@ -303,10 +318,10 @@ function buildWork(opts: CaptureOptions, world: CaptureWorld): string[] {
 /**
  * Run a sweep.
  *
- * Throughput is fixed by the global pacer, so concurrency exists only to keep the pipe full
- * while a response is in flight (a couple of workers is plenty). Worlds are visited from a
- * rotating offset so consecutive runs start somewhere new: with a time budget in play, that
- * is what stops the same first worlds from being the only ones ever scanned.
+ * Throughput comes from working several worlds at once with one request in flight per world.
+ * Worlds are visited from a rotating offset so consecutive runs start somewhere new: with a
+ * time budget in play, that is what stops the same first worlds from being the only ones ever
+ * scanned.
  */
 export async function captureShopping(opts: CaptureOptions): Promise<CaptureStats> {
   const key = config.shopApiKey;
@@ -337,17 +352,26 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
     // worlds that actually trade have been covered. A rotating few still finds new shop
     // worlds over time without starving the ones we know about.
     const explore = Math.max(0, opts.exploreColdWorlds ?? 8);
-    const offset = cold.length ? Math.floor(Date.now() / (2 * 60 * 60 * 1000)) % cold.length : 0;
+    const turn = Math.floor(Date.now() / (2 * 60 * 60 * 1000));
+    const offset = cold.length ? turn % cold.length : 0;
     const rotated = [...cold.slice(offset), ...cold.slice(0, offset)].slice(0, explore);
-    queue = [...hot, ...rotated];
+    // ROTATE THE HOT WORLDS TOO. Workers now claim a whole world at a time, so a run that hits
+    // its deadline stops partway down this list and everything after it gets nothing at all.
+    // Left in a fixed order, the tail would never be scanned however many times the job ran.
+    // (Under the old interleaved loop every world advanced together, so order did not matter
+    // and only the cold ones needed rotating.)
+    const hotOff = hot.length ? turn % hot.length : 0;
+    queue = [...hot.slice(hotOff), ...hot.slice(0, hotOff), ...rotated];
   }
 
   const totalReq = queue.reduce((n, t) => n + t.work.length, 0);
-  const estMin = Math.round((totalReq * config.shopPaceMs) / 60000);
+  const lanes = Math.max(1, Math.min(config.shopWorldConcurrency, queue.length));
+  const estMin = Math.round((totalReq * config.shopPaceMs) / lanes / 60000);
   const budgetMin = Math.round(config.shopTimeBudgetMs / 60000);
   console.log(
     `shopping ${opts.mode}: ${queue.length} worlds, ${totalReq} requests planned ` +
-      `(~${estMin} min at ${config.shopPaceMs}ms/request), budget ${budgetMin} min`,
+      `(~${estMin} min at ${config.shopPaceMs}ms/request across ${lanes} worlds at once), ` +
+      `budget ${budgetMin} min`,
   );
   // A plan that cannot finish is not a plan, it is a truncation. Say so, because a silently
   // cut sweep is exactly how the catalogue ended up a seventh covered.
@@ -358,11 +382,9 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
     );
   }
 
-  // INTERLEAVE the work across worlds instead of finishing one world at a time.
-  // Beyond the per-key response rate there is clearly a per-server component too: pacing at
-  // 1600ms while hammering a SINGLE world still drew ~28% rejections, whereas the same pace
-  // rotating over six worlds drew none. Round-robin gives each game server a long gap
-  // between our requests while the global pacer still caps the overall rate.
+  // ONE WORKER PER WORLD, several worlds at a time. Each worker owns its world and never has
+  // more than one request in flight against it, which is the rule the docs actually state;
+  // the parallelism is across game servers, where nothing forbids it.
   const buffers = queue.map<WorldBuffer>((t) => ({ world: t.world, scanned: [], listings: [] }));
   const flush = async (buf: WorldBuffer) => {
     if (!buf.scanned.length) return;
@@ -376,51 +398,72 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
     buf.listings = [];
   };
 
-  const maxLen = queue.reduce((n, t) => Math.max(n, t.work.length), 0);
   const touched = new Set<number>();
   /*
    * Flush everything periodically, not only at the end.
    *
    * POST_CHUNK alone does not deliver on its promise that an interrupted run keeps what it
-   * captured. A discovery run walks a few dozen items per world, so no single buffer reaches
-   * 200 keys. Nor does flushing "when a world is done" help: work is interleaved, so every
-   * world finishes on the same final index and they would all still flush together at the end.
-   * Time is the only thing that actually divides the run, so results go out every few minutes.
+   * captured: a discovery run walks a few dozen items per world, so no single buffer reaches
+   * 200 keys. Time is the thing that actually divides a run, so results go out every few
+   * minutes and an interruption costs at most that.
    */
   const FLUSH_EVERY_MS = 3 * 60 * 1000;
   let lastFlush = Date.now();
-  const flushAll = async () => {
-    for (const b of buffers) await flush(b);
-    lastFlush = Date.now();
+  let flushing: Promise<void> | null = null;
+  const flushAllDue = async () => {
+    if (Date.now() - lastFlush < FLUSH_EVERY_MS || flushing) return;
+    flushing = (async () => {
+      for (const b of buffers) await flush(b);
+      lastFlush = Date.now();
+    })();
+    await flushing;
+    flushing = null;
   };
 
-  outer: for (let i = 0; i < maxLen; i++) {
-    if (Date.now() - lastFlush > FLUSH_EVERY_MS) await flushAll();
-    for (let w = 0; w < queue.length; w++) {
-      const item = queue[w].work[i];
-      if (item === undefined) continue;
+  // Workers take whole worlds off a shared queue, so a world with a short list does not leave
+  // its slot idle while another grinds through a long one.
+  let nextWorld = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const w = nextWorld++;
+      if (w >= queue.length) return;
       if (Date.now() > deadline) {
         stats.truncated = true;
-        break outer;
+        return;
       }
-      const [idStr, type] = item.split(":");
-      const itemId = Number(idStr);
-      if (!Number.isFinite(itemId) || (type !== "S" && type !== "B")) continue;
       const buf = buffers[w];
-      const found = await fetchListings(buf.world.apiUrl, type, itemId, key, pacer, stats);
-      touched.add(buf.world.id);
-      if (found === null) {
-        stats.errors++;
-        // Left out of `scanned` on purpose: the ingest must not treat listings it could not
-        // verify as deleted. Failing safe beats deleting real data.
-        continue;
+      for (const item of queue[w].work) {
+        if (Date.now() > deadline) {
+          stats.truncated = true;
+          break;
+        }
+        const [idStr, type] = item.split(":");
+        const itemId = Number(idStr);
+        if (!Number.isFinite(itemId) || (type !== "S" && type !== "B")) continue;
+        const found = await fetchListings(buf.world.apiUrl, type, itemId, key, pacer, stats);
+        touched.add(buf.world.id);
+        if (found === null) {
+          stats.errors++;
+          // Left out of `scanned` on purpose: the ingest must not treat listings it could not
+          // verify as deleted. Failing safe beats deleting real data.
+          continue;
+        }
+        stats.listings += found.length;
+        buf.listings.push(...found);
+        buf.scanned.push(item);
+        if (buf.scanned.length >= POST_CHUNK) await flush(buf);
       }
-      stats.listings += found.length;
-      buf.listings.push(...found);
-      buf.scanned.push(item);
-      if (buf.scanned.length >= POST_CHUNK) await flush(buf);
+      // This world is finished, so its results can go out now rather than at the end of the
+      // whole run. With one worker per world this is a real boundary, unlike the interleaved
+      // version where every world finished on the same final index.
+      await flush(buf);
+      await flushAllDue();
     }
-  }
+  };
+
+  const workers = Math.max(1, Math.min(config.shopWorldConcurrency, queue.length));
+  await Promise.all(Array.from({ length: workers }, () => worker()));
+
   for (const buf of buffers) await flush(buf);
   stats.worldsDone = touched.size;
   return stats;

@@ -140,7 +140,12 @@ async function main(): Promise<void> {
 
     const tradingWorlds =
       Math.max(1, Object.keys(active).length || worlds.length) + Number(process.env.SHOP_EXPLORE_WORLDS ?? 8);
-    const affordable = Math.floor(config.shopTimeBudgetMs / config.shopPaceMs / 2 / tradingWorlds);
+    // Requests a run can afford: the budget divided by the pace, multiplied by the number of
+    // worlds worked at once, then split over the two shop types and the worlds visited.
+    const lanes = Math.max(1, config.shopWorldConcurrency);
+    const affordable = Math.floor(
+      ((config.shopTimeBudgetMs / config.shopPaceMs) * lanes) / 2 / tradingWorlds,
+    );
     const window = config.shopDiscoverWindow > 0 ? config.shopDiscoverWindow : Math.max(10, affordable);
     if (effectiveMode === "discover") {
       console.log(
