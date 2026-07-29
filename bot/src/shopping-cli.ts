@@ -130,13 +130,21 @@ async function main(): Promise<void> {
   try {
     // Sized so a run can actually finish what it plans: the budget in requests, divided by
     // the two shop types and the worlds we will visit. Anything larger is just truncation.
+    // Every item we already hold a listing for, anywhere. The hot sweep keeps these fresh, so
+    // discovery can stop hunting them and move down the ranking.
+    const knownItems = new Set<number>();
+    for (const a of Object.values(active)) {
+      for (const id of a.S) knownItems.add(id);
+      for (const id of a.B) knownItems.add(id);
+    }
+
     const tradingWorlds =
       Math.max(1, Object.keys(active).length || worlds.length) + Number(process.env.SHOP_EXPLORE_WORLDS ?? 8);
     const affordable = Math.floor(config.shopTimeBudgetMs / config.shopPaceMs / 2 / tradingWorlds);
     const window = config.shopDiscoverWindow > 0 ? config.shopDiscoverWindow : Math.max(10, affordable);
     if (effectiveMode === "discover") {
       console.log(
-        `discovery walks ${window} items this run` +
+        `discovery walks ${window} items this run, ${knownItems.size} already found` +
           (priority.length ? `, busiest first (${priority.length} ranked)` : ", catalogue order (no ranking available)"),
       );
     }
@@ -151,6 +159,7 @@ async function main(): Promise<void> {
       priority,
       window,
       exploreColdWorlds: Number(process.env.SHOP_EXPLORE_WORLDS ?? 8),
+      knownItems,
     });
     const mins = ((Date.now() - started) / 60000).toFixed(1);
     console.log(

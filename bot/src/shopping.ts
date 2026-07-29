@@ -220,6 +220,8 @@ export interface CaptureOptions {
   window?: number;
   /** Never-yet-trading worlds to probe per run, on top of every world known to trade. */
   exploreColdWorlds?: number;
+  /** Item ids already known to have listings somewhere. Discovery hunts the ones that are not. */
+  knownItems?: Set<number>;
 }
 
 /**
@@ -261,11 +263,35 @@ function buildWork(opts: CaptureOptions, world: CaptureWorld): string[] {
     }
     const window = opts.window && opts.window > 0 ? opts.window : items.length;
     if (window < items.length) {
-      const windows = Math.ceil(items.length / window);
-      const turn = (opts.shard ?? 0) % windows;
-      const start = turn * window;
-      // Wraps, so the last window is full rather than a stub.
-      items = [...items, ...items].slice(start, start + window);
+      /*
+       * Discovery hunts what we have NOT found yet, busiest first.
+       *
+       * The obvious scheme, a window that rotates with the clock, was wrong in a way that only
+       * showed up in the numbers: the turn is derived from the timestamp, so the very first run
+       * after the change landed on window 36 of 40 and spent an hour on the 1044th to 1073rd
+       * most traded items. 2549 requests returned 148 listings, and Rough Oortstone, ranked
+       * 5th, was still missing afterwards.
+       *
+       * Once an item is found anywhere it moves into the hot sweep, which keeps it fresh
+       * cheaply. So discovery should not look at it again: it should always start from the
+       * most traded thing we have never seen. That advances on its own, with no stored cursor,
+       * because every run shortens the list it draws from.
+       *
+       * A slice of the run still goes to items we HAVE found, rotating, so a listing appearing
+       * on a world we have not checked for that item is eventually noticed too.
+       */
+      const known = opts.knownItems ?? new Set<number>();
+      const unseen = items.filter((id) => !known.has(id));
+      const seen = items.filter((id) => known.has(id));
+      const hunt = Math.max(1, Math.round(window * 0.75));
+      const revisit = Math.max(0, window - hunt);
+      const offset = seen.length ? (opts.shard ?? 0) % seen.length : 0;
+      items = [
+        ...unseen.slice(0, hunt),
+        ...[...seen.slice(offset), ...seen.slice(0, offset)].slice(0, revisit),
+      ];
+      // Everything popular is already found: spend the whole run revisiting instead.
+      if (!items.length) items = [...seen.slice(offset), ...seen.slice(0, offset)].slice(0, window);
     }
   }
 
@@ -352,7 +378,24 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
 
   const maxLen = queue.reduce((n, t) => Math.max(n, t.work.length), 0);
   const touched = new Set<number>();
+  /*
+   * Flush everything periodically, not only at the end.
+   *
+   * POST_CHUNK alone does not deliver on its promise that an interrupted run keeps what it
+   * captured. A discovery run walks a few dozen items per world, so no single buffer reaches
+   * 200 keys. Nor does flushing "when a world is done" help: work is interleaved, so every
+   * world finishes on the same final index and they would all still flush together at the end.
+   * Time is the only thing that actually divides the run, so results go out every few minutes.
+   */
+  const FLUSH_EVERY_MS = 3 * 60 * 1000;
+  let lastFlush = Date.now();
+  const flushAll = async () => {
+    for (const b of buffers) await flush(b);
+    lastFlush = Date.now();
+  };
+
   outer: for (let i = 0; i < maxLen; i++) {
+    if (Date.now() - lastFlush > FLUSH_EVERY_MS) await flushAll();
     for (let w = 0; w < queue.length; w++) {
       const item = queue[w].work[i];
       if (item === undefined) continue;
@@ -375,11 +418,7 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
       stats.listings += found.length;
       buf.listings.push(...found);
       buf.scanned.push(item);
-      // Flush on a full chunk OR as soon as this world's work is done. Without the second
-      // condition the promise in POST_CHUNK's comment is empty: a discovery run walks only a
-      // few dozen items per world, so no buffer ever reaches 200 and everything would be held
-      // until the very end, losing a whole run to any interruption.
-      if (buf.scanned.length >= POST_CHUNK || i === queue[w].work.length - 1) await flush(buf);
+      if (buf.scanned.length >= POST_CHUNK) await flush(buf);
     }
   }
   for (const buf of buffers) await flush(buf);
