@@ -122,11 +122,15 @@ export function parseShopping(buf: Buffer, itemId: number, type: ShopType): Shop
 export class ShopKeyError extends Error {}
 
 /**
- * Spacing between requests.
+ * Spacing between requests, ONE INSTANCE PER WORLD.
  *
- * Now a politeness floor rather than the design constraint it used to be: throughput comes
- * from running one request per world across many worlds, and this only stops any single
- * worker from hammering. Kept shared so the total footprint still has a ceiling.
+ * It must not be shared, and a shared one is how the first parallel run quietly ran at a
+ * quarter of its intended rate: eight workers queueing through a single 250ms pacer is 4
+ * requests a second in total, not 4 each. The run reported 10,778 requests in 45.1 minutes,
+ * which is 3.98/sec: the pacer, not the game servers, was the ceiling.
+ *
+ * Per world it is what it claims to be, a floor on how hard any single game server is asked,
+ * while the aggregate is bounded by the worker count instead.
  */
 export class Pacer {
   private next = 0;
@@ -330,7 +334,6 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
     requests: 0, listings: 0, errors: 0, worldsDone: 0, rowsWritten: 0, truncated: false,
     throttled: 0,
   };
-  const pacer = new Pacer(config.shopPaceMs);
 
   const all = opts.worlds
     .map((w) => ({ world: w, work: buildWork(opts, w) }))
@@ -432,6 +435,9 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
         return;
       }
       const buf = buffers[w];
+      // This world's own pacer. See the class comment: sharing one across the workers turns
+      // the floor into a global ceiling and undoes the parallelism entirely.
+      const pacer = new Pacer(config.shopPaceMs);
       for (const item of queue[w].work) {
         if (Date.now() > deadline) {
           stats.truncated = true;
