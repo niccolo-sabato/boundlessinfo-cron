@@ -211,21 +211,64 @@ export interface CaptureOptions {
   active?: Record<string, { S: number[]; B: number[] }>;
   shard?: number;
   shards?: number;
+  /**
+   * Item ids ordered by how much they actually trade, busiest first. Discovery walks this
+   * order rather than an arbitrary one; see buildWork for why that matters so much.
+   */
+  priority?: number[];
+  /** How many items one discovery run walks. See config.shopDiscoverWindow. */
+  window?: number;
+  /** Never-yet-trading worlds to probe per run, on top of every world known to trade. */
+  exploreColdWorlds?: number;
 }
 
-/** Build the per-world work list for the requested mode. */
+/**
+ * Build the per-world work list for the requested mode.
+ *
+ * DISCOVERY ORDER IS THE WHOLE GAME. The API answers one request per second per key, so a
+ * scheduled run affords a couple of thousand requests against a catalogue of 1136 items on 39
+ * trading worlds: about 88,000 requests for one complete pass, which is a day and a half of
+ * uninterrupted asking. Whatever the run does NOT reach simply does not exist on the site
+ * until some later run happens to pick it.
+ *
+ * The first version split items by `id % shards`, which is arbitrary: an item's numeric id
+ * says nothing about whether anyone trades it. The result was exactly what you would expect
+ * and what the owner spotted straight away: after days of capturing we held 156 of 1136 items,
+ * and Rough Oortstone, one of the most traded things in the game, was missing entirely while
+ * obscure items had been swept.
+ *
+ * So discovery now walks items in order of how much they actually trade, taking a window that
+ * a run can realistically finish and rotating that window by the clock so the rest follows.
+ * The ranking comes from the mirrored BUTT snapshot, which has been capturing this same API
+ * for years; it is used only to decide what we look at first, never as data we serve.
+ */
 function buildWork(opts: CaptureOptions, world: CaptureWorld): string[] {
   if (opts.mode === "hot") {
     const a = opts.active?.[String(world.id)];
     if (!a) return [];
     return [...a.S.map((i) => `${i}:S`), ...a.B.map((i) => `${i}:B`)];
   }
-  const shards = opts.shards ?? 1;
-  const shard = opts.shard ?? 0;
-  const items =
-    opts.mode === "discover" && shards > 1
-      ? opts.itemIds.filter((id) => id % shards === shard)
-      : opts.itemIds;
+
+  let items = opts.itemIds;
+  if (opts.mode === "discover") {
+    const priority = opts.priority?.length ? opts.priority : null;
+    if (priority) {
+      const rank = new Map(priority.map((id, i) => [id, i]));
+      // Items the ranking has never seen go last: nobody has been observed trading them.
+      items = [...items].sort(
+        (a, b) => (rank.get(a) ?? Number.MAX_SAFE_INTEGER) - (rank.get(b) ?? Number.MAX_SAFE_INTEGER),
+      );
+    }
+    const window = opts.window && opts.window > 0 ? opts.window : items.length;
+    if (window < items.length) {
+      const windows = Math.ceil(items.length / window);
+      const turn = (opts.shard ?? 0) % windows;
+      const start = turn * window;
+      // Wraps, so the last window is full rather than a stub.
+      items = [...items, ...items].slice(start, start + window);
+    }
+  }
+
   const work: string[] = [];
   for (const id of items) work.push(`${id}:S`, `${id}:B`);
   return work;
@@ -262,17 +305,32 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
     const known = new Set(Object.keys(opts.active ?? {}).map(Number));
     const hot = all.filter((t) => known.has(t.world.id));
     const cold = all.filter((t) => !known.has(t.world.id));
-    const offset = cold.length ? new Date().getUTCHours() % cold.length : 0;
-    queue = [...hot, ...cold.slice(offset), ...cold.slice(0, offset)];
+    // Only a handful of never-yet-trading worlds per run. Work is interleaved round-robin
+    // across the queue, so including all hundred-odd of them does not merely add work at the
+    // end: it dilutes every pass, and the time budget then cuts the sweep off before the
+    // worlds that actually trade have been covered. A rotating few still finds new shop
+    // worlds over time without starving the ones we know about.
+    const explore = Math.max(0, opts.exploreColdWorlds ?? 8);
+    const offset = cold.length ? Math.floor(Date.now() / (2 * 60 * 60 * 1000)) % cold.length : 0;
+    const rotated = [...cold.slice(offset), ...cold.slice(0, offset)].slice(0, explore);
+    queue = [...hot, ...rotated];
   }
 
   const totalReq = queue.reduce((n, t) => n + t.work.length, 0);
   const estMin = Math.round((totalReq * config.shopPaceMs) / 60000);
+  const budgetMin = Math.round(config.shopTimeBudgetMs / 60000);
   console.log(
     `shopping ${opts.mode}: ${queue.length} worlds, ${totalReq} requests planned ` +
-      `(~${estMin} min at ${config.shopPaceMs}ms/request), ` +
-      `budget ${Math.round(config.shopTimeBudgetMs / 60000)} min`,
+      `(~${estMin} min at ${config.shopPaceMs}ms/request), budget ${budgetMin} min`,
   );
+  // A plan that cannot finish is not a plan, it is a truncation. Say so, because a silently
+  // cut sweep is exactly how the catalogue ended up a seventh covered.
+  if (estMin > budgetMin) {
+    console.log(
+      `  NOTE: this plan needs ${estMin} min but has ${budgetMin}. ` +
+        `About ${Math.round((budgetMin / estMin) * 100)}% will be reached; the rest waits for the next run.`,
+    );
+  }
 
   // INTERLEAVE the work across worlds instead of finishing one world at a time.
   // Beyond the per-key response rate there is clearly a per-server component too: pacing at

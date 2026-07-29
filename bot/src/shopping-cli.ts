@@ -49,6 +49,22 @@ async function loadItemIds(): Promise<number[]> {
   return items.map((i) => i.game_id).filter((n) => Number.isFinite(n));
 }
 
+/**
+ * Item ids ordered by how much they actually trade, busiest first.
+ *
+ * Derived from the mirrored BUTT snapshot and committed as static data. Only used to decide
+ * what discovery looks at first; if it is missing we fall back to catalogue order, which is
+ * how the sweep behaved before and is merely slower to find the interesting things.
+ */
+async function loadPriority(): Promise<number[]> {
+  try {
+    const ids = await getJson<number[]>(`${SITE_DATA}/shop-priority.json`);
+    return Array.isArray(ids) ? ids.filter((n) => Number.isFinite(n)) : [];
+  } catch {
+    return [];
+  }
+}
+
 async function main(): Promise<void> {
   const mode = (arg("mode") ?? process.env.SHOP_MODE ?? "hot") as "hot" | "discover" | "full";
   if (!["hot", "discover", "full"].includes(mode)) throw new Error(`unknown mode ${mode}`);
@@ -59,14 +75,17 @@ async function main(): Promise<void> {
   let worlds = await loadWorlds();
   if (worldFilter?.length) worlds = worlds.filter((w) => worldFilter.includes(w.id));
   const itemIds = itemFilter?.length ? itemFilter : await loadItemIds();
+  const priority = await loadPriority();
 
   const shards = config.shopShards;
   // Rotate the discovery shard by wall-clock hour so consecutive scheduled runs cover
   // different slices of the catalogue without any stored cursor.
   const shard = Number(arg("shard") ?? process.env.SHOP_SHARD ?? NaN);
+  // Advances once per scheduled run (every 2 hours) and keeps advancing across days, so the
+  // window walks the whole priority list instead of revisiting the same slice each day.
   const effectiveShard = Number.isFinite(shard)
     ? shard
-    : Math.floor(new Date().getUTCHours() / (24 / shards)) % shards;
+    : Math.floor(Date.now() / (2 * 60 * 60 * 1000));
 
   // Always loaded: "hot" scans exactly these keys, and "discover" uses them to visit
   // already-trading worlds first (see captureShopping).
@@ -109,6 +128,19 @@ async function main(): Promise<void> {
   const started = Date.now();
   let note = "";
   try {
+    // Sized so a run can actually finish what it plans: the budget in requests, divided by
+    // the two shop types and the worlds we will visit. Anything larger is just truncation.
+    const tradingWorlds =
+      Math.max(1, Object.keys(active).length || worlds.length) + Number(process.env.SHOP_EXPLORE_WORLDS ?? 8);
+    const affordable = Math.floor(config.shopTimeBudgetMs / config.shopPaceMs / 2 / tradingWorlds);
+    const window = config.shopDiscoverWindow > 0 ? config.shopDiscoverWindow : Math.max(10, affordable);
+    if (effectiveMode === "discover") {
+      console.log(
+        `discovery walks ${window} items this run` +
+          (priority.length ? `, busiest first (${priority.length} ranked)` : ", catalogue order (no ranking available)"),
+      );
+    }
+
     const stats = await captureShopping({
       mode: effectiveMode,
       worlds,
@@ -116,6 +148,9 @@ async function main(): Promise<void> {
       active,
       shard: effectiveShard,
       shards,
+      priority,
+      window,
+      exploreColdWorlds: Number(process.env.SHOP_EXPLORE_WORLDS ?? 8),
     });
     const mins = ((Date.now() - started) / 60000).toFixed(1);
     console.log(

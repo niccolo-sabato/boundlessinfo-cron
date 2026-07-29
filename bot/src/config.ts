@@ -165,10 +165,21 @@ export const config = {
    */
   shopTimeBudgetMs: optInt("SHOP_TIME_BUDGET_MS", 55 * 60 * 1000),
   /**
-   * Discovery sweeps rotate through item shards (item_id % shards) so the whole catalogue is
-   * covered over a day (12 shards, one per 2-hourly run) without any single run being unbounded.
+   * Kept for the manual `--shard=` override only. Discovery no longer splits by `item_id %
+   * shards`: a numeric id says nothing about whether anyone trades an item, and that scheme
+   * left the catalogue a seventh covered with Rough Oortstone missing. See buildWork.
    */
   shopShards: optInt("SHOP_SHARDS", 12),
+  /**
+   * How many items one discovery run walks, across every world it visits.
+   *
+   * The binding constraint is the API's one response per second, so a 50-minute run affords
+   * about 2500 requests. Spread over roughly 39 trading worlds and two shop types that is
+   * about thirty items, and pretending otherwise just means the run is cut off mid-sweep.
+   * 0 means "work it out from the time budget and the number of worlds", which is usually
+   * what you want.
+   */
+  shopDiscoverWindow: optInt("SHOP_DISCOVER_WINDOW", 0),
 
   // --- Official HTTP LOD0 Map API (a SEPARATE blessed key from the shopping one) ---
   /** Sent as the `Boundless-API-Key` header on `<apiURL>/lod0`. Never logged, never committed. */
