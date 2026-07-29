@@ -375,7 +375,11 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
       stats.listings += found.length;
       buf.listings.push(...found);
       buf.scanned.push(item);
-      if (buf.scanned.length >= POST_CHUNK) await flush(buf);
+      // Flush on a full chunk OR as soon as this world's work is done. Without the second
+      // condition the promise in POST_CHUNK's comment is empty: a discovery run walks only a
+      // few dozen items per world, so no buffer ever reaches 200 and everything would be held
+      // until the very end, losing a whole run to any interruption.
+      if (buf.scanned.length >= POST_CHUNK || i === queue[w].work.length - 1) await flush(buf);
     }
   }
   for (const buf of buffers) await flush(buf);
