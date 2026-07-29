@@ -17,9 +17,14 @@
 # capture under any name, because the permanent worlds were regenerated after 2020. A map of
 # a planet that no longer exists would put every shop marker on meaningless ground.
 #
-# Two modes. 'new' only maps worlds we hold nothing for, which is what drains the backlog.
-# 'refresh' additionally re-captures maps older than MAP_REFRESH_DAYS, so player building
-# eventually shows up.
+# Two modes. 'new' only maps worlds we hold nothing for. 'refresh' does that FIRST and then
+# re-captures stale maps, so it is a superset and is what the schedule runs: with 'new' on the
+# schedule the job silently becomes a no-op the moment the backlog drains, and every map ages
+# forever. Unmapped worlds always outrank stale ones, so a new sovereign or a fresh nexus is
+# still picked up ahead of any refresh.
+#
+# Staleness is activity-aware: worlds that trade go stale after MAP_REFRESH_DAYS_ACTIVE (7
+# days), quiet ones after MAP_REFRESH_DAYS (30). Terrain changes where people build.
 #
 # STORAGE IS CAPPED IN CODE. The ingest endpoint refuses an upload that would push us past a
 # self-imposed ceiling (200 worlds / 3 GiB, against an R2 free tier of 10 GB) and the run
@@ -33,7 +38,12 @@ on:
     # Twice a day, off the hour. At roughly twelve minutes a world, a five-hour run covers
     # about twenty worlds, so the whole universe is mapped within a few days and refreshes
     # comfortably inside a month afterwards.
+    # The long pass, twice a day: drains any backlog, then refreshes what has gone stale.
     - cron: '41 3,15 * * *'
+    # A short sweep every three hours that ONLY looks for worlds we hold no map for. A new
+    # sovereign or a nexus otherwise waits up to twelve hours for its first map. When there
+    # is nothing new this costs one call to our own coverage endpoint and exits.
+    - cron: '11 0,6,9,12,18,21 * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -91,14 +101,16 @@ jobs:
         if: ${{ github.event.inputs.dry_run != 'true' }}
         working-directory: bot
         env:
-          MAP_TIME_BUDGET_MS: '18000000' # 5 hours
-        run: npm run maps -- --mode=${{ github.event.inputs.mode || 'new' }} ${{ github.event.inputs.worlds && format('--worlds={0}', github.event.inputs.worlds) || '' }} ${{ github.event.inputs.max && format('--max={0}', github.event.inputs.max) || '' }}
+          # The short new-only sweeps get a small budget (about four worlds); the twice-daily
+          # pass gets five hours. A manual dispatch uses whatever it asks for.
+          MAP_TIME_BUDGET_MS: ${{ github.event.schedule == '11 0,6,9,12,18,21 * * *' && '3000000' || '18000000' }}
+        run: npm run maps -- --mode=${{ github.event.inputs.mode || (github.event.schedule == '11 0,6,9,12,18,21 * * *' && 'new' || 'refresh') }} ${{ github.event.inputs.worlds && format('--worlds={0}', github.event.inputs.worlds) || '' }} ${{ github.event.inputs.max && format('--max={0}', github.event.inputs.max) || '' }}
 
       # --- Plan only (workflow_dispatch): show what a run WOULD do, capture nothing. ---
       - name: Show the plan
         if: ${{ github.event.inputs.dry_run == 'true' }}
         working-directory: bot
-        run: npm run maps -- --dry-run --mode=${{ github.event.inputs.mode || 'new' }}
+        run: npm run maps -- --dry-run --mode=${{ github.event.inputs.mode || 'refresh' }}
 
       # --- Notify Telegram if anything above failed (best-effort, no-op if unset) ---
       # This also fires when the storage cap stops a run, which is exactly when the owner

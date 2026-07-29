@@ -218,6 +218,14 @@ export const config = {
    */
   mapRefreshDays: optInt("MAP_REFRESH_DAYS", 30),
   /**
+   * Staleness threshold for worlds that actually trade, in days.
+   *
+   * Terrain changes where players build, and players build where the shops are. Refreshing
+   * all 144 worlds on one clock either wastes ten-minute captures on empty planets or lets
+   * the busy ones drift; two thresholds spend the time where something has changed.
+   */
+  mapRefreshDaysActive: optInt("MAP_REFRESH_DAYS_ACTIVE", 7),
+  /**
    * Refuse absurd worlds outright. A side of 8192 blocks is already 67 megapixels and about
    * 200 MB per working buffer; anything beyond that is a data error, not a planet.
    */
