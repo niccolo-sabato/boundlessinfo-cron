@@ -12,9 +12,12 @@
 #   2. DISCOVER hunts the most-traded items we have never found anywhere, ordered by real
 #               trade volume rather than by an arbitrary slice of the id space.
 #
-# Both passes work eight worlds at a time with one request in flight per world, which is what
-# the documented rate limit actually permits. A pass over the trading worlds is roughly an
-# hour, so the catalogue is refreshed at about the cadence BUTT publishes.
+# ENGINE CONTRACT (from the official docs, reference/boundless.docs/modding/http-shopping.rst):
+# the only rate rule is ONE request in flight per key per game server, and the docs say
+# explicitly that no client-side delaying or retrying is needed: the server regulates by
+# holding responses. The bot therefore runs one strictly serial lane per world, eight lanes at
+# a time, with no pacing. Measured sustained: ~0.87 verified units/lane/sec, so a full pass
+# over the traded catalogue (~78k units) is about three hours; the hot pass is minutes.
 # Both passes stop at their time budget and simply continue next run: the ingest only
 # deletes listings for keys it actually verified, so an interrupted sweep is always safe.
 
@@ -43,22 +46,16 @@ concurrency:
 env:
   BOUNDLESS_API_KEY: ${{ secrets.BOUNDLESS_API_KEY }}
   INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
-  # The documented rule is one in-flight request per key per GAME SERVER, so the parallelism
-  # goes ACROSS worlds: eight at a time, one request in flight each. Measured against the live
-  # servers in successful responses per second: 1.53 at concurrency 1, 8.62 at 4, 18.29 at 8,
-  # 25.32 at 16. About half of all requests are shed at every level including 1, so rejections
-  # are back-pressure on a cache miss and not a sign of going too wide; they are retried.
-  #
-  # These were '1' and '1200ms' on the belief that the per-key response rate was a hard global
-  # cap. It is not, and that belief cost the site most of its catalogue.
+  # One serial lane per world satisfies the documented one-in-flight rule by construction;
+  # the lanes are the throughput. No SHOP_PACE_MS here on purpose: the docs say client-side
+  # delays are not needed, and the code default (0) is the documented mode. The env knob still
+  # exists as an emergency brake should upstream behaviour ever change.
   SHOP_WORLD_CONCURRENCY: '8'
-  SHOP_PACE_MS: '250'
-  SHOP_SHARDS: '12'
 
 jobs:
   capture:
     runs-on: ubuntu-latest
-    timeout-minutes: 130
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
 
@@ -83,21 +80,20 @@ jobs:
         if: ${{ github.event.inputs.mode == '' || github.event.inputs.mode == 'both' || github.event.inputs.mode == 'hot' }}
         working-directory: bot
         env:
-          # 55 min. A refresh of everything we hold is items x 2 x 39 trading worlds; at the
-          # full 995-item catalogue that is ~78,000 requests, about 71 minutes at the measured
-          # 18.3 responses/sec. This does not have to finish in one run (the worlds rotate, so
-          # the next one continues elsewhere), but it should get most of the way.
-          SHOP_TIME_BUDGET_MS: '3300000'
+          # 30 min. Hot only re-checks (world,item,type) triples that already hold listings:
+          # a few thousand units, minutes at the measured ~7 units/sec on 8 lanes. The budget
+          # is headroom, not the expected duration; worlds rotate between runs so a truncated
+          # tail is picked up next time.
+          SHOP_TIME_BUDGET_MS: '1800000'
         run: npm run shopping -- --mode=hot
 
-      # --- 2. DISCOVER: find new listings, one rotating item shard across all worlds ---
-      - name: Discovery sweep (rotating item shard)
+      # --- 2. DISCOVER: hunt the busiest items not yet found anywhere ---
+      - name: Discovery sweep (busiest unfound items)
         if: ${{ github.event.inputs.mode == '' || github.event.inputs.mode == 'both' || github.event.inputs.mode == 'discover' }}
         working-directory: bot
         env:
-          # 30 min, DOWN from 50. Discovery used to be the expensive half because it walked
-          # the unfound catalogue at a request a second; now it is the cheap half and the
-          # catalogue fills within a few runs, after which there is little left to discover.
+          # 30 min. Discovery hunts the busiest never-found items; as the catalogue fills,
+          # each run has less to do and finishes early on its own.
           SHOP_TIME_BUDGET_MS: '1800000'
           SHOP_SHARD: ${{ github.event.inputs.shard }}
         run: npm run shopping -- --mode=discover
@@ -107,9 +103,10 @@ jobs:
         if: ${{ github.event.inputs.mode == 'full' }}
         working-directory: bot
         env:
-          # 100 min. Every item on every queued world is ~107,000 requests, about 97 minutes
-          # at the measured rate, and this step runs alone so it has the job to itself.
-          SHOP_TIME_BUDGET_MS: '6000000'
+          # 210 min. A complete pass is ~78,000 units at the measured ~7 units/sec on 8
+          # lanes, about three hours; this step runs alone (manual dispatch) so it has the
+          # whole job to itself.
+          SHOP_TIME_BUDGET_MS: '12600000'
         run: npm run shopping -- --mode=full
 
       # --- Snapshot today's weighted-average price bands (idempotent upsert) ---

@@ -7,39 +7,62 @@
  *   B = request basket-> a player BUYS, so you can SELL to it
  * Auth: header `Boundless-API-Key`.
  *
- * THE RATE LIMIT, from the official docs, is two separate rules:
- *   1. "Each API key is permitted to have 1 request in-flight that hits a GIVEN GAME SERVER:
- *      any attempt to run concurrent requests will return 429 responses."
- *   2. "Responses will be returned up to a rate of 1 response per second for each api-key."
+ * RATE LIMITING, from `reference/boundless.docs/modding/http-shopping.rst`, which is the
+ * contract this engine is built against. The docs state ONE rule and two reassurances,
+ * quoted verbatim because earlier versions of this file paraphrased them into a design that
+ * was wrong three different ways:
  *
- * I originally read rule 2 as a hard global cap and built everything around one shared pacer
- * at a request a second. THAT WAS WRONG, and it cost the site most of its catalogue: after
- * days of capturing we held 156 items of 1136.
+ *   "this rate-limiting has only one rule that users should follow: Each API key is
+ *    permitted to have 1 request in-flight that hits a given game server: any attempt to
+ *    run concurrent requests will return 429 responses."
  *
- * What gave it away was BUTT, which reads the same API: its mirror holds the entire 995-item
- * catalogue captured inside a 6.6 hour window, which needs roughly twelve successful responses
- * a second. So I measured the thing I should have measured the first time, which is SUCCESSFUL
- * RESPONSES PER SECOND rather than the rejection rate:
+ *   "rate-limiting is handled by the server queueing incoming responses so that your
+ *    response simply takes longer to come back ... there is no need to handle delaying
+ *    requests or retrying on the user-side."
  *
- *   concurrency  1 ->  1.53 good responses/sec
- *   concurrency  4 ->  8.62
- *   concurrency  8 -> 18.29
- *   concurrency 16 -> 25.32
+ *   "Responses will be returned up to a rate of 1 response per second for each api-key ...
+ *    but you do not need to delay your next request."
  *
- * Roughly half of all requests are shed at EVERY level, including concurrency 1, so the
- * rejections were never caused by going wide: that is just the server balancing us against
- * other users on a cache miss, exactly as the docs describe. The earlier conclusion looked at
- * that 50% and stopped, when the throughput underneath it scales almost linearly.
+ * So the engine is shaped as: ONE SERIAL LANE PER WORLD (which satisfies the only rule by
+ * construction, no timer involved), several lanes at once, and NO CLIENT-SIDE PACING,
+ * because the server is the regulator and says so explicitly.
  *
- * So the capture now runs ONE REQUEST IN FLIGHT PER WORLD, across many worlds at once, which
- * is precisely what rule 1 permits. A 403 is still back-pressure and never a fact about the
- * item, so it is retried and never recorded.
+ * WHERE THE DOCS ARE SILENT, we measured against the live servers (2026-07-29):
+ *  - A cache miss is often SHED as a bare 403 (empty body, `cache-control: no-cache`).
+ *    This status is not documented for the shopping route at all; on the beacons/lod0
+ *    routes 403 means "bad key", so a run that sees ONLY 403s must abort as a key failure
+ *    (circuit breaker below) rather than grind its budget out.
+ *  - The shed is deterministic, not probabilistic: a cold (world,item) turned 200 after
+ *    exactly 3 immediate retries in 12 cases out of 12. Retrying is what warms the cache.
+ *    Once warm, the same query answers 200 back-to-back with no delay.
+ *  - No shed response ever carried a `retry-after` header (0 of 44), so any client-side
+ *    backoff for 403 would be invented, and an earlier version of this file lost ~70% of a
+ *    run's wall clock to exactly that invention.
+ *  - Sustained throughput, measured over 4 minutes (bursts lie; a 1.3s sample once said
+ *    "18/sec" for what is really ~5/sec): ~0.87 verified (world,item,type) units per lane
+ *    per second, ~2.6 requests per unit. That is EST_UNIT_MS below, and it prices a full
+ *    pass (995 items x 2 types x 39 trading worlds ~ 78k units) at about three hours on
+ *    eight lanes. BUTT, reading the same API, cycles its catalogue in 6.6 hours: same
+ *    physics, more conservative settings.
+ *
+ * STATUS HANDLING, each per its documented meaning:
+ *   200  parse; an EMPTY body is a valid "no shops here".
+ *   403  undocumented cache-miss shed: up to 5 immediate retries, then the unit stays
+ *        unverified. Never recorded as an absence.
+ *   429  we broke the one-in-flight rule. With serial lanes this must never happen, so it
+ *        is counted separately and logged loudly: it means a bug, not bad luck.
+ *   503  the world is not in a serving state (starting, stopping, locked). Documented on
+ *        the sibling routes as a WORLD condition, so the lane skips the world for this run
+ *        instead of hammering the next item into the same wall.
+ *   net  our side or the wire in between: two attempts with a short pause, then unverified.
  *
  * Robustness rules:
- *  - Every run is bounded by a wall-clock budget; leftovers are picked up next run.
+ *  - Every run is bounded by a wall-clock budget; leftovers are picked up next run, and the
+ *    world order rotates between runs so a truncated tail is not always the same worlds.
  *  - Results are posted in chunks as we go, so a killed run keeps everything captured.
  *  - The ingest only deletes listings for keys it actually verified, so a partial sweep can
  *    never wipe unrelated data.
+ *  - A run whose first 30 requests are ALL shed with zero 200s aborts as a key failure.
  */
 
 import { config } from "./config.ts";
@@ -68,13 +91,29 @@ export interface CaptureWorld {
 
 export interface CaptureStats {
   requests: number;
+  /** 200 responses. */
+  ok: number;
+  /** 403: cache-miss sheds (undocumented; retried in place). */
+  shed: number;
+  /** 503: world not in a serving state (documented; skips the world). */
+  busy: number;
+  /** 429: one-in-flight violations. Serial lanes make this impossible, so >0 means a bug. */
+  overrate: number;
+  /** Network / timeout failures on our side of the wire. */
+  netErrors: number;
   listings: number;
+  /** (world,item,type) units verified this run. */
+  itemsDone: number;
+  /** Units given up on (left unverified, never treated as absent). */
   errors: number;
+  /** Ingest POST failures. Separate from `errors`: these units were verified, then the
+   *  write failed; the data stays buffered and the next flush retries it. */
+  ingestErrors: number;
   worldsDone: number;
+  /** Worlds abandoned mid-run on a 503. */
+  worldsSkipped: number;
   rowsWritten: number;
   truncated: boolean;
-  /** Requests that came back 403/429 and had to be retried (rate-limit pressure). */
-  throttled: number;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -122,76 +161,90 @@ export function parseShopping(buf: Buffer, itemId: number, type: ShopType): Shop
 export class ShopKeyError extends Error {}
 
 /**
- * Spacing between requests, ONE INSTANCE PER WORLD.
+ * Measured cost of verifying one (world,item,type) unit on one lane, wall-clock.
  *
- * It must not be shared, and a shared one is how the first parallel run quietly ran at a
- * quarter of its intended rate: eight workers queueing through a single 250ms pacer is 4
- * requests a second in total, not 4 each. The run reported 10,778 requests in 45.1 minutes,
- * which is 3.98/sec: the pacer, not the game servers, was the ceiling.
- *
- * Per world it is what it claims to be, a floor on how hard any single game server is asked,
- * while the aggregate is bounded by the worker count instead.
+ * From a 4-minute sustained run with no pacing (bursts overstate by 3-4x, so never re-derive
+ * this from a short sample): ~0.87 units per lane per second, ~2.6 requests per unit. Used
+ * only for PLANNING (run estimates, discovery window sizing); nothing delays on it.
  */
-export class Pacer {
-  private next = 0;
-  private readonly intervalMs: number;
-  // An explicit field, not a constructor parameter property: the bot runs through Node's
-  // type-stripping loader, which cannot emit the implicit assignment.
-  constructor(intervalMs: number) {
-    this.intervalMs = intervalMs;
-  }
-  async take(): Promise<void> {
-    const now = Date.now();
-    const at = Math.max(now, this.next);
-    this.next = at + this.intervalMs;
-    const wait = at - now;
-    if (wait > 0) await sleep(wait);
-  }
-}
+export const EST_UNIT_MS = 1150;
+
+/** Immediate retries a shed (403) unit gets. Measured: a cold unit answers by the 3rd. */
+const SHED_RETRIES = 5;
+
+/** How a lane's single fetch resolved; drives what the worker does next. */
+type FetchOutcome =
+  | { kind: "ok"; listings: ShopListing[] }
+  | { kind: "unverified" }
+  | { kind: "world-busy" };
 
 /**
- * Fetch one (world, type, item), paced globally.
+ * Fetch one (world, item, type) unit on this world's serial lane.
  *
- * 403 and 429 are both treated as back-pressure: they are retried with growing backoff and
- * never interpreted as "this item does not exist". Returns null when the request could not
- * be completed, so the caller can leave that key out of the verified set (and therefore out
- * of the deletion pass) instead of guessing.
+ * Each status is handled per its documented meaning (see the module header for the map and
+ * for the measurements behind the retry counts). The one thing this function must never do
+ * is guess: a unit it could not verify comes back `unverified`, which keeps it out of the
+ * ingest's deletion pass, rather than being reported as "no shops".
  */
 async function fetchListings(
   apiUrl: string,
   type: ShopType,
   itemId: number,
   key: string,
-  pacer: Pacer,
   stats: CaptureStats,
-): Promise<ShopListing[] | null> {
+): Promise<FetchOutcome> {
   const url = `${apiUrl}/shopping/${type}/${itemId}`;
-  for (let attempt = 0; attempt < 4; attempt++) {
-    await pacer.take();
+  let shedTries = 0;
+  let netTries = 0;
+  let overrateTries = 0;
+  for (;;) {
     try {
       const res = await fetch(url, {
         headers: { "Boundless-API-Key": key, "accept-encoding": "gzip" },
         signal: AbortSignal.timeout(config.requestTimeoutMs),
       });
       stats.requests++;
-      if (res.status === 403 || res.status === 429 || res.status === 503) {
-        stats.throttled++;
-        const retryAfter = Number(res.headers.get("retry-after"));
-        const backoff = Number.isFinite(retryAfter) && retryAfter > 0
-          ? Math.min(retryAfter * 1000, 30_000)
-          : 1500 * (attempt + 1);
-        await sleep(backoff);
+      if (res.status === 200) {
+        stats.ok++;
+        const buf = Buffer.from(await res.arrayBuffer());
+        // An empty body is a valid answer meaning "no shops for this item here".
+        return { kind: "ok", listings: buf.length === 0 ? [] : parseShopping(buf, itemId, type) };
+      }
+      if (res.status === 403) {
+        // Cache-miss shed. Immediate retry is what warms the cache; no delay, because no
+        // shed response has ever asked for one and the wait would be invented.
+        stats.shed++;
+        if (++shedTries <= SHED_RETRIES) continue;
+        return { kind: "unverified" };
+      }
+      if (res.status === 503) {
+        // The WORLD is not serving (starting, stopping, locked). Retrying the next item
+        // into the same wall helps nobody: the caller drops the world for this run.
+        stats.busy++;
+        return { kind: "world-busy" };
+      }
+      if (res.status === 429) {
+        // The documented penalty for a second in-flight request. Serial lanes make this
+        // structurally impossible, so it is a bug indicator, not weather: say so, give the
+        // server a beat, and move on. BOUNDED like every other path: an unbounded retry here
+        // would trap the lane inside this call, where neither the wall-clock deadline nor the
+        // circuit breaker can reach it (both live in the worker loop, which only regains
+        // control when this function returns).
+        stats.overrate++;
+        console.warn(`  429 on ${url}: one-in-flight violated, this should be impossible`);
+        if (++overrateTries >= 3) return { kind: "unverified" };
+        await sleep(1000);
         continue;
       }
-      if (!res.ok) return null;
-      const buf = Buffer.from(await res.arrayBuffer());
-      // An empty body is a valid answer meaning "no shops for this item here".
-      return buf.length === 0 ? [] : parseShopping(buf, itemId, type);
+      // Anything else (invalid args, unexpected state): not verifiable, not retryable.
+      return { kind: "unverified" };
     } catch {
-      await sleep(1000 * (attempt + 1));
+      // Our side of the wire: timeout, DNS, socket. One measured pause, two chances.
+      stats.netErrors++;
+      if (++netTries >= 2) return { kind: "unverified" };
+      await sleep(1000);
     }
   }
-  return null;
 }
 
 /** POST one chunk of a world's scan to the ingest endpoint. Returns rows written. */
@@ -219,6 +272,15 @@ interface WorldBuffer {
   world: CaptureWorld;
   scanned: string[];
   listings: ShopListing[];
+  /** Set after a failed ingest POST: no re-attempt before this time. Without it, a downed
+   *  ingest turns every over-threshold unit into a fresh 30s-timeout POST and stalls the
+   *  lane; with it, the data waits quietly and the next due flush retries. */
+  retryAfter?: number;
+  /** The in-flight flush of this buffer, if any. Guarantees single flight per buffer: the
+   *  owner's POST_CHUNK trigger and another worker's clock sweep can otherwise flush the
+   *  same buffer concurrently, and the slower one's stale-snapshot splice would clamp onto
+   *  units pushed after the faster one drained, discarding them unsent. */
+  busy?: Promise<void>;
 }
 
 export interface CaptureOptions {
@@ -331,8 +393,9 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
   const key = config.shopApiKey;
   const deadline = Date.now() + config.shopTimeBudgetMs;
   const stats: CaptureStats = {
-    requests: 0, listings: 0, errors: 0, worldsDone: 0, rowsWritten: 0, truncated: false,
-    throttled: 0,
+    requests: 0, ok: 0, shed: 0, busy: 0, overrate: 0, netErrors: 0,
+    listings: 0, itemsDone: 0, errors: 0, ingestErrors: 0, worldsDone: 0, worldsSkipped: 0,
+    rowsWritten: 0, truncated: false,
   };
 
   const all = opts.worlds
@@ -345,7 +408,11 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
   // then everything else from a rotating offset so new shop worlds are still found over
   // time without any stored cursor.
   let queue = all;
-  if (opts.mode !== "hot") {
+  // DISCOVER only: hot worlds first plus a rotating handful of never-yet-trading ones.
+  // "hot" already restricts itself to known triples, and "full" must mean what it says:
+  // every world, every item. An earlier version applied this cap to "full" too, so the one
+  // mode whose entire purpose is exhaustive backfill silently skipped most cold worlds.
+  if (opts.mode === "discover") {
     const known = new Set(Object.keys(opts.active ?? {}).map(Number));
     const hot = all.filter((t) => known.has(t.world.id));
     const cold = all.filter((t) => !known.has(t.world.id));
@@ -367,14 +434,13 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
     queue = [...hot.slice(hotOff), ...hot.slice(0, hotOff), ...rotated];
   }
 
-  const totalReq = queue.reduce((n, t) => n + t.work.length, 0);
+  const totalUnits = queue.reduce((n, t) => n + t.work.length, 0);
   const lanes = Math.max(1, Math.min(config.shopWorldConcurrency, queue.length));
-  const estMin = Math.round((totalReq * config.shopPaceMs) / lanes / 60000);
+  const estMin = Math.round((totalUnits * EST_UNIT_MS) / lanes / 60000);
   const budgetMin = Math.round(config.shopTimeBudgetMs / 60000);
   console.log(
-    `shopping ${opts.mode}: ${queue.length} worlds, ${totalReq} requests planned ` +
-      `(~${estMin} min at ${config.shopPaceMs}ms/request across ${lanes} worlds at once), ` +
-      `budget ${budgetMin} min`,
+    `shopping ${opts.mode}: ${queue.length} worlds, ${totalUnits} units planned ` +
+      `(~${estMin} min at ${EST_UNIT_MS}ms/unit across ${lanes} lanes), budget ${budgetMin} min`,
   );
   // A plan that cannot finish is not a plan, it is a truncation. Say so, because a silently
   // cut sweep is exactly how the catalogue ended up a seventh covered.
@@ -390,15 +456,55 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
   // the parallelism is across game servers, where nothing forbids it.
   const buffers = queue.map<WorldBuffer>((t) => ({ world: t.world, scanned: [], listings: [] }));
   const flush = async (buf: WorldBuffer) => {
+    /*
+     * SINGLE FLIGHT PER BUFFER. Two call sites can reach the same buffer concurrently (the
+     * owner's POST_CHUNK trigger, and the clock sweep run by whichever worker finished a
+     * world), and two overlapping flushes corrupt each other: the slower one's splice runs
+     * on a stale snapshot and clamps onto units the faster one never sent. Waiting out the
+     * in-flight flush and re-checking is correct for every caller: whatever data remains is
+     * picked up here or by the next trigger, and at end-of-run all workers have returned so
+     * nothing can be in flight.
+     *
+     * The check-to-assign sequence below is synchronous (no await between the `busy` check
+     * and `buf.busy = job`), which is what makes the lock sound in single-threaded JS.
+     */
+    while (buf.busy) await buf.busy;
     if (!buf.scanned.length) return;
+    if (buf.retryAfter && Date.now() < buf.retryAfter) return;
+    /*
+     * Snapshot the lengths BEFORE the await, and on success remove exactly that many.
+     *
+     * While this POST is in flight the owning worker can push more units into these same
+     * arrays. A wholesale `buf.scanned = []` on success would discard those late arrivals
+     * without sending them: counted as done, never written, no error anywhere. Splicing only
+     * the sent prefix keeps them for the next flush. The push pairs (listings, then scanned
+     * key, no await between) are atomic, so a snapshot can never split a unit's listings
+     * from its key across two POSTs.
+     */
+    const job = (async () => {
+      const nScanned = buf.scanned.length;
+      const nListings = buf.listings.length;
+      try {
+        stats.rowsWritten += await postChunk(
+          buf.world.id,
+          buf.scanned.slice(0, nScanned),
+          buf.listings.slice(0, nListings),
+        );
+        buf.scanned.splice(0, nScanned);
+        buf.listings.splice(0, nListings);
+        buf.retryAfter = undefined;
+      } catch (err) {
+        stats.ingestErrors++;
+        buf.retryAfter = Date.now() + 60_000;
+        console.warn(`  world ${buf.world.id}: ingest failed, kept ${buf.scanned.length} units buffered: ${(err as Error).message}`);
+      }
+    })();
+    buf.busy = job;
     try {
-      stats.rowsWritten += await postChunk(buf.world.id, buf.scanned, buf.listings);
-    } catch (err) {
-      stats.errors++;
-      console.warn(`  world ${buf.world.id}: ingest failed: ${(err as Error).message}`);
+      await job;
+    } finally {
+      buf.busy = undefined;
     }
-    buf.scanned = [];
-    buf.listings = [];
   };
 
   const touched = new Set<number>();
@@ -423,39 +529,68 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
     flushing = null;
   };
 
+  /**
+   * Circuit breaker for a dead key.
+   *
+   * On the sibling routes a 403 is documented as "the API key was not acceptable", and a
+   * rejected key sheds EVERY request. A healthy run cannot look like that: measured, a cold
+   * unit answers 200 within 3 retries, so 30 requests with zero 200s is not a cold cache,
+   * it is a key that no longer works. Aborting beats spending the whole budget confirming it.
+   */
+  let abort: ShopKeyError | null = null;
+  const breakerTripped = () => stats.requests >= 30 && stats.ok === 0;
+
   // Workers take whole worlds off a shared queue, so a world with a short list does not leave
-  // its slot idle while another grinds through a long one.
+  // its slot idle while another grinds through a long one. Each lane is strictly serial,
+  // which satisfies the documented one-in-flight-per-game-server rule BY CONSTRUCTION; there
+  // is deliberately no client-side pacing anywhere, because the docs say the server is the
+  // regulator ("there is no need to handle delaying requests ... on the user-side").
   let nextWorld = 0;
   const worker = async (): Promise<void> => {
     for (;;) {
       const w = nextWorld++;
-      if (w >= queue.length) return;
+      if (w >= queue.length || abort) return;
       if (Date.now() > deadline) {
         stats.truncated = true;
         return;
       }
       const buf = buffers[w];
-      // This world's own pacer. See the class comment: sharing one across the workers turns
-      // the floor into a global ceiling and undoes the parallelism entirely.
-      const pacer = new Pacer(config.shopPaceMs);
       for (const item of queue[w].work) {
+        if (abort) return;
         if (Date.now() > deadline) {
           stats.truncated = true;
           break;
         }
+        // Emergency brake only: 0 in normal operation, because the docs say client-side
+        // delays are not needed. See config.shopPaceMs.
+        if (config.shopPaceMs > 0) await sleep(config.shopPaceMs);
         const [idStr, type] = item.split(":");
         const itemId = Number(idStr);
         if (!Number.isFinite(itemId) || (type !== "S" && type !== "B")) continue;
-        const found = await fetchListings(buf.world.apiUrl, type, itemId, key, pacer, stats);
+        const outcome = await fetchListings(buf.world.apiUrl, type, itemId, key, stats);
         touched.add(buf.world.id);
-        if (found === null) {
+        if (breakerTripped()) {
+          abort = new ShopKeyError(
+            `${stats.requests} requests, zero 200s: the key is being rejected, not throttled`,
+          );
+          return;
+        }
+        if (outcome.kind === "world-busy") {
+          // Documented world condition. Keep what we verified, drop the rest of this world
+          // for the run; the between-run rotation brings it back around.
+          stats.worldsSkipped++;
+          console.log(`  world ${buf.world.id} (${buf.world.name ?? "?"}): 503, skipping for this run`);
+          break;
+        }
+        if (outcome.kind === "unverified") {
           stats.errors++;
           // Left out of `scanned` on purpose: the ingest must not treat listings it could not
           // verify as deleted. Failing safe beats deleting real data.
           continue;
         }
-        stats.listings += found.length;
-        buf.listings.push(...found);
+        stats.itemsDone++;
+        stats.listings += outcome.listings.length;
+        buf.listings.push(...outcome.listings);
         buf.scanned.push(item);
         if (buf.scanned.length >= POST_CHUNK) await flush(buf);
       }
@@ -470,7 +605,20 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
   const workers = Math.max(1, Math.min(config.shopWorldConcurrency, queue.length));
   await Promise.all(Array.from({ length: workers }, () => worker()));
 
-  for (const buf of buffers) await flush(buf);
+  for (const buf of buffers) {
+    buf.retryAfter = undefined; // the end of the run is this data's last chance: always try
+    await flush(buf);
+  }
   stats.worldsDone = touched.size;
+  if (abort) throw abort;
+
+  // Plan versus reality, so the next person tuning this reads measurements instead of hopes.
+  const elapsedMin = (config.shopTimeBudgetMs - Math.max(0, deadline - Date.now())) / 60000;
+  const unitRate = elapsedMin > 0 ? stats.itemsDone / (elapsedMin * 60) : 0;
+  console.log(
+    `  sustained: ${unitRate.toFixed(2)} units/sec on ${workers} lanes ` +
+      `(${(stats.requests / Math.max(1, stats.itemsDone)).toFixed(2)} requests/unit; ` +
+      `estimate constant says ${(1000 / EST_UNIT_MS * workers).toFixed(2)})`,
+  );
   return stats;
 }

@@ -142,29 +142,28 @@ export const config = {
   /**
    * How many worlds are worked on at once, with ONE request in flight per world.
    *
-   * This is where the throughput is, and the earlier value of 1 was a mistake that cost the
-   * site most of its catalogue. Measured against the live servers in successful responses per
-   * second: 1.53 at concurrency 1, 8.62 at 4, 18.29 at 8, 25.32 at 16. Roughly half of all
-   * requests are shed at every level including 1, so the rejections never came from going
-   * wide. The docs allow one in-flight request per key per GAME SERVER, which is exactly what
-   * one worker per world does.
+   * The documented rule is one in-flight request per key per GAME SERVER, and a serial lane
+   * per world satisfies it by construction. The lanes are where the throughput is: measured
+   * sustained, each verifies ~0.87 (world,item,type) units a second, so eight lanes price a
+   * full catalogue pass (~78k units) at about three hours.
    *
-   * 8 rather than 16: it already gives an order of magnitude over the old behaviour, and
-   * there is no reason to take the last of the headroom from a shared game server.
+   * 8 rather than more: that already matches the cadence BUTT sustains against the same API,
+   * and there is no reason to take more headroom from servers other players are using.
+   * (History: this was 1 for weeks, from misreading the per-key response rate as a global
+   * budget. It cost the site most of its catalogue: 156 items of 1136 after days of running.)
    */
   shopWorldConcurrency: optInt("SHOP_WORLD_CONCURRENCY", 8),
   /**
-   * Minimum spacing between ANY two shopping requests, across every world, honouring the
-   * official "up to 1 response per second for each api-key" with margin.
+   * OPTIONAL spacing between two requests to the same world, milliseconds. Default 0.
    *
-   * Measured, so we do not over-tune: the rejection rate on genuine cache misses is roughly
-   * 10-20% and does NOT fall as we slow down (1600ms, 2600ms and 4000ms all rejected a
-   * similar share). That back-pressure is the server balancing us against other users and
-   * the in-game Knowledge queries, exactly as the docs describe, so the answer is to retry
-   * politely rather than to crawl. Repeated reads are also served from the server's own
-   * 30-minute cache and never reach the game server at all.
+   * The official docs are explicit that no client-side delay is needed ("there is no need to
+   * handle delaying requests or retrying on the user-side ... you do not need to delay your
+   * next request"): the one-in-flight rule is satisfied structurally by the serial lane, and
+   * the server itself regulates by holding responses. This knob exists only as an emergency
+   * brake to be set from the environment if the upstream ever changes behaviour; leaving it
+   * at 0 is the documented, intended mode.
    */
-  shopPaceMs: optInt("SHOP_PACE_MS", 250),
+  shopPaceMs: optInt("SHOP_PACE_MS", 0),
   /**
    * Hard wall-clock budget for one sweep. Whatever is left unscanned is simply picked up by
    * the next run (the ingest only ever deletes keys it actually verified), so every run is
@@ -180,11 +179,9 @@ export const config = {
   /**
    * How many items one discovery run walks, across every world it visits.
    *
-   * The binding constraint is the API's one response per second, so a 50-minute run affords
-   * about 2500 requests. Spread over roughly 39 trading worlds and two shop types that is
-   * about thirty items, and pretending otherwise just means the run is cut off mid-sweep.
-   * 0 means "work it out from the time budget and the number of worlds", which is usually
-   * what you want.
+   * Sized from the measured per-unit cost (EST_UNIT_MS) so the plan fits the time budget
+   * instead of being silently truncated mid-sweep. 0 means "work it out from the budget,
+   * the lanes and the number of worlds", which is usually what you want.
    */
   shopDiscoverWindow: optInt("SHOP_DISCOVER_WINDOW", 0),
 

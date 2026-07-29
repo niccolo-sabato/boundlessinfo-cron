@@ -3,21 +3,21 @@
  *
  *   npm run shopping                 # mode from SHOP_MODE (default: hot)
  *   npm run shopping -- --mode=hot        # re-check only what is known to be traded
- *   npm run shopping -- --mode=discover   # rotating item shard across every world
+ *   npm run shopping -- --mode=discover   # hunt the busiest items not yet found anywhere
  *   npm run shopping -- --mode=full       # everything (long; manual use)
  *   npm run shopping -- --rollup          # also snapshot today's price bands
  *   npm run shopping -- --worlds=1,31 --items=32805   # targeted, for testing
  *
  * The two scheduled modes complement each other:
  *  - "hot" keeps prices fresh cheaply (only (world,item,type) triples that hold listings).
- *  - "discover" finds NEW listings by rotating through item shards, so the whole catalogue
- *    is covered over a day while every single run stays time-bounded.
+ *  - "discover" walks the trade-volume ranking for items we hold nothing on, so the
+ *    catalogue fills busiest-first while every single run stays time-bounded.
  * A fresh/empty database makes "hot" find nothing, so it automatically falls back to a
  * discovery sweep: the system bootstraps itself with no extra state to maintain.
  */
 
 import { config } from "./config.ts";
-import { captureShopping, ShopKeyError, type CaptureWorld } from "./shopping.ts";
+import { captureShopping, EST_UNIT_MS, ShopKeyError, type CaptureWorld } from "./shopping.ts";
 
 const SITE_DATA = process.env.SITE_DATA_BASE ?? "https://boundlessinfo.pages.dev/data";
 
@@ -138,13 +138,17 @@ async function main(): Promise<void> {
       for (const id of a.B) knownItems.add(id);
     }
 
+    // The run's REAL queue is the known-trading worlds plus the explore handful; the engine
+    // caps cold worlds to that handful even when the database is empty. Falling back to "all
+    // worlds" here (an earlier version did) made this divisor an order of magnitude too big
+    // on a bootstrap run, so the window came out tiny and the budget went unused.
     const tradingWorlds =
-      Math.max(1, Object.keys(active).length || worlds.length) + Number(process.env.SHOP_EXPLORE_WORLDS ?? 8);
-    // Requests a run can afford: the budget divided by the pace, multiplied by the number of
-    // worlds worked at once, then split over the two shop types and the worlds visited.
+      Math.max(1, Object.keys(active).length + Number(process.env.SHOP_EXPLORE_WORLDS ?? 8));
+    // Units a run can afford: the budget divided by the measured per-unit cost, multiplied
+    // by the lanes, then split over the two shop types and the worlds visited.
     const lanes = Math.max(1, config.shopWorldConcurrency);
     const affordable = Math.floor(
-      ((config.shopTimeBudgetMs / config.shopPaceMs) * lanes) / 2 / tradingWorlds,
+      ((config.shopTimeBudgetMs / EST_UNIT_MS) * lanes) / 2 / tradingWorlds,
     );
     const window = config.shopDiscoverWindow > 0 ? config.shopDiscoverWindow : Math.max(10, affordable);
     if (effectiveMode === "discover") {
@@ -168,19 +172,37 @@ async function main(): Promise<void> {
     });
     const mins = ((Date.now() - started) / 60000).toFixed(1);
     console.log(
-      `done in ${mins} min: ${stats.requests} requests, ${stats.listings} listings seen, ` +
-        `${stats.rowsWritten} rows written, ${stats.worldsDone} worlds, ${stats.errors} errors, ` +
-        `${stats.throttled} throttled` +
+      `done in ${mins} min: ${stats.itemsDone}/${stats.itemsDone + stats.errors} units verified, ` +
+        `${stats.listings} listings, ${stats.rowsWritten} rows written, ` +
+        `${stats.worldsDone} worlds (${stats.worldsSkipped} skipped on 503)` +
         (stats.truncated ? " (time budget reached, remainder next run)" : ""),
     );
-    note = stats.truncated ? "time budget reached" : "ok";
+    console.log(
+      `  responses: ${stats.ok} ok, ${stats.shed} shed(403), ${stats.busy} busy(503), ` +
+        `${stats.overrate} overrate(429), ${stats.netErrors} network, of ${stats.requests} requests` +
+        (stats.ingestErrors ? `; ${stats.ingestErrors} ingest failures (data retried in-run)` : ""),
+    );
+    if (stats.overrate > 0) {
+      console.warn(
+        `  WARNING: ${stats.overrate} responses were 429. The serial lane should make that ` +
+          `impossible; if this repeats, something else is using this key concurrently.`,
+      );
+    }
+    note = stats.truncated
+      ? "time budget reached"
+      : stats.ingestErrors
+        ? `ok (${stats.ingestErrors} ingest failures)`
+        : "ok";
     if (runId) {
       await fetch(`${config.apiBase}/api/ingest/shopping/run`, {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${config.ingestToken}` },
         body: JSON.stringify({
           action: "finish", id: runId, worlds: stats.worldsDone, requests: stats.requests,
-          listings: stats.listings, rows: stats.rowsWritten, errors: stats.errors, note,
+          listings: stats.listings, rows: stats.rowsWritten,
+          // errors = units left unverified; ingest failures are a different animal (verified
+          // but unwritten) and would otherwise hide behind a green run in the dashboard.
+          errors: stats.errors + stats.ingestErrors, note,
         }),
         signal: AbortSignal.timeout(20_000),
       }).catch(() => {});
