@@ -59,6 +59,38 @@ export interface BeaconPack {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Run-length encode the plot-ownership grid: [value, runLength, value, runLength, ...].
+ *
+ * The grid is 576x576 = 331,776 cells on a standard world, 648 KB raw, and an earlier version
+ * of this bot refused to send it for exactly that reason. That was the right worry about the
+ * wrong encoding. The grid is 87-91% zeros and the owned parts are contiguous blocks, which
+ * is the shape RLE was invented for. Measured on real captures:
+ *
+ *   Maryx        363 beacons, 13.3% owned -> 7,189 runs,  40 KB json,  7.3 KB gzipped
+ *   Sochaltin I   78 beacons,  9.3% owned -> 2,634 runs,  14 KB json,  2.3 KB gzipped
+ *
+ * At a few kilobytes a world the whole universe is under a megabyte, so the plot map is
+ * affordable to store, to serve and to draw beacon boundaries from.
+ */
+export function encodePlotRuns(owner: Uint16Array): number[] {
+  const runs: number[] = [];
+  if (owner.length === 0) return runs;
+  let value = owner[0];
+  let count = 1;
+  for (let i = 1; i < owner.length; i++) {
+    if (owner[i] === value) {
+      count++;
+    } else {
+      runs.push(value, count);
+      value = owner[i];
+      count = 1;
+    }
+  }
+  runs.push(value, count);
+  return runs;
+}
+
 /** Decode the binary pack. Throws rather than half-parsing: a truncated read is a bug. */
 export function parseBeacons(buf: Buffer): BeaconPack {
   let o = 0;
