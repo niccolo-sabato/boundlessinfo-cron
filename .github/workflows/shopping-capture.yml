@@ -9,7 +9,7 @@
 # Every run does two bounded passes:
 #   1. HOT      re-checks only the (world,item,type) triples that already hold listings, so
 #               live prices stay fresh without re-walking the whole catalogue.
-#   2. FULL, nightly: every item on every trading world, both sides. This is what makes the
+#   2. FULL, every six hours: every item on every trading world, both sides. Makes the
 #               coverage complete, and it retires DISCOVER, which existed only because a
 #               complete pass used to be unaffordable. Discovery remains dispatchable.
 #
@@ -38,11 +38,15 @@ on:
     # HOT every two hours: re-reads only the triples that already hold listings, so prices
     # stay fresh. Minutes of work.
     - cron: '23 */2 * * *'
-    # FULL once a day, in the quiet hours: every item on every trading world, both sides.
-    # This is what makes coverage COMPLETE rather than "whatever we happened to find", and
-    # it is the pass that retires discovery: an item is no longer "found" or "unfound", every
-    # (world, item, side) is simply visited.
-    - cron: '7 2 * * *'
+    # FULL every six hours: every item on every trading world, both sides. A pass takes
+    # about four hours, so this is as close to continuous as a cron can get while leaving
+    # room for the pass to finish and for the hot pass to slip in between.
+    #
+    # For scale: BUTT cycles its catalogue in 6.6 hours against this same API. Four hours is
+    # already faster, and four passes a day means any listing is at most six hours old with
+    # the popular ones far fresher, because a busy item sits on twenty-odd worlds that are
+    # each visited at a different point in the cycle.
+    - cron: '7 0,6,12,18 * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -98,7 +102,7 @@ jobs:
 
       # --- 1. HOT: keep known listings fresh (cheap) ---
       - name: Hot sweep (refresh known listings)
-        if: ${{ github.event.schedule != '7 2 * * *' && (github.event.inputs.mode == '' || github.event.inputs.mode == 'both' || github.event.inputs.mode == 'hot') }}
+        if: ${{ github.event.schedule != '7 0,6,12,18 * * *' && (github.event.inputs.mode == '' || github.event.inputs.mode == 'both' || github.event.inputs.mode == 'hot') }}
         working-directory: bot
         env:
           # 30 min. Hot only re-checks (world,item,type) triples that already hold listings:
@@ -121,7 +125,7 @@ jobs:
 
       # --- 3. FULL: nightly, and on demand. Every item on every trading world, both sides ---
       - name: Full sweep
-        if: ${{ github.event.schedule == '7 2 * * *' || github.event.inputs.mode == 'full' }}
+        if: ${{ github.event.schedule == '7 0,6,12,18 * * *' || github.event.inputs.mode == 'full' }}
         working-directory: bot
         env:
           # 330 min. A complete pass over 48 trading worlds is 48 x 1136 x 2 = ~109,000 units
