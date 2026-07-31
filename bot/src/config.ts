@@ -216,15 +216,20 @@ export const config = {
    * How old a map may get before a run is allowed to spend its budget refreshing it. Terrain
    * only changes where players build, so a month is generous; new worlds always come first.
    */
-  mapRefreshDays: optInt("MAP_REFRESH_DAYS", 30),
   /**
-   * Staleness threshold for worlds that actually trade, in days.
+   * How old a map may get before it is re-captured, in days. ONE threshold for every world.
    *
-   * Terrain changes where players build, and players build where the shops are. Refreshing
-   * all 144 worlds on one clock either wastes ten-minute captures on empty planets or lets
-   * the busy ones drift; two thresholds spend the time where something has changed.
+   * It was 30, with a 7-day fast lane for worlds that trade. Both parts were wrong. Thirty
+   * days is far too long for a map people navigate by, and "has shops" is the wrong signal
+   * for "has builds": a world can be covered in builds and sell nothing, and that world was
+   * being demoted to the slow lane precisely because nobody had put a stand on it.
+   *
+   * The capacity was there all along. Measured over 145 real captures: median 5.5 minutes,
+   * p90 11.8, so a complete pass over every world is 18.2 hours of capture time against the
+   * ~70 hours a week the schedule provides. A weekly refresh of the entire universe costs
+   * about a quarter of the budget, so there is no reason to ration it by activity at all.
    */
-  mapRefreshDaysActive: optInt("MAP_REFRESH_DAYS_ACTIVE", 7),
+  mapRefreshDays: optInt("MAP_REFRESH_DAYS", 7),
   /**
    * Refuse absurd worlds outright. A side of 8192 blocks is already 67 megapixels and about
    * 200 MB per working buffer; anything beyond that is a data error, not a planet.

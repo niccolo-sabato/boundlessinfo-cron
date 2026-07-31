@@ -149,9 +149,9 @@ export interface Job {
  *   1. Worlds that have shops and no map at all. That is exactly what the release needs.
  *   2. Any other world with no map, permanent ones first: they are where players mostly
  *      trade, and unlike sovereigns and exos they never expire.
- *   3. Worlds whose map has gone stale, oldest first, and only in 'refresh' mode. Trading
- *      worlds go stale sooner than quiet ones (7 days against 30): terrain changes where
- *      people build, and a ten-minute capture of an untouched planet buys nothing.
+ *   3. Worlds whose map has gone stale, oldest first, and only in 'refresh' mode. ONE
+ *      threshold for every world, seven days: a map people navigate by has to be recent,
+ *      and "has shops" was never a sound proxy for "has builds".
  *
  * Note that the unmapped bands (0-2) always outrank the stale bands (3-4), which is what
  * lets ONE scheduled mode do both jobs: a new sovereign or a fresh nexus is picked up on the
@@ -174,8 +174,7 @@ export function planMapWork(opts: MapCaptureOptions): Job[] {
       continue;
     }
     if (opts.mode !== "refresh") continue;
-    const limit = hasShops ? config.mapRefreshDaysActive * 86400 : staleAfter;
-    if (now - held.at > limit) {
+    if (now - held.at > staleAfter) {
       jobs.push({
         world: w,
         priority: hasShops ? 3 : 4,

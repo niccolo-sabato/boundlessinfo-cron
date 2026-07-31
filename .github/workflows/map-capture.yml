@@ -23,8 +23,10 @@
 # forever. Unmapped worlds always outrank stale ones, so a new sovereign or a fresh nexus is
 # still picked up ahead of any refresh.
 #
-# Staleness is activity-aware: worlds that trade go stale after MAP_REFRESH_DAYS_ACTIVE (7
-# days), quiet ones after MAP_REFRESH_DAYS (30). Terrain changes where people build.
+# Every world is re-captured after MAP_REFRESH_DAYS (7). Measured over 145 real captures the
+# median takes 5.5 minutes, so a complete pass over the universe is 18.2 hours of capture time
+# against the ~70 hours a week this schedule provides: a weekly refresh of everything costs
+# about a quarter of the budget, which is why it is not rationed by activity.
 #
 # STORAGE IS CAPPED IN CODE. The ingest endpoint refuses an upload that would push us past a
 # self-imposed ceiling (200 worlds / 3 GiB, against an R2 free tier of 10 GB) and the run
@@ -40,10 +42,11 @@ on:
     # comfortably inside a month afterwards.
     # The long pass, twice a day: drains any backlog, then refreshes what has gone stale.
     - cron: '41 3,15 * * *'
-    # A short sweep every three hours that ONLY looks for worlds we hold no map for. A new
-    # sovereign or a nexus otherwise waits up to twelve hours for its first map. When there
-    # is nothing new this costs one call to our own coverage endpoint and exits.
-    - cron: '11 0,6,9,12,18,21 * * *'
+    # HOURLY sweep for worlds we hold no map for. Exos live for days and sovereigns appear at
+    # any hour, so "within the hour" is the difference between a usable map and a planet that
+    # is gone before we drew it. Costs one call to our own coverage endpoint and exits in
+    # about fifteen seconds when there is nothing new, which is most of the time.
+    - cron: '11 * * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -103,8 +106,8 @@ jobs:
         env:
           # The short new-only sweeps get a small budget (about four worlds); the twice-daily
           # pass gets five hours. A manual dispatch uses whatever it asks for.
-          MAP_TIME_BUDGET_MS: ${{ github.event.schedule == '11 0,6,9,12,18,21 * * *' && '3000000' || '18000000' }}
-        run: npm run maps -- --mode=${{ github.event.inputs.mode || (github.event.schedule == '11 0,6,9,12,18,21 * * *' && 'new' || 'refresh') }} ${{ github.event.inputs.worlds && format('--worlds={0}', github.event.inputs.worlds) || '' }} ${{ github.event.inputs.max && format('--max={0}', github.event.inputs.max) || '' }}
+          MAP_TIME_BUDGET_MS: ${{ github.event.schedule == '11 * * * *' && '3000000' || '18000000' }}
+        run: npm run maps -- --mode=${{ github.event.inputs.mode || (github.event.schedule == '11 * * * *' && 'new' || 'refresh') }} ${{ github.event.inputs.worlds && format('--worlds={0}', github.event.inputs.worlds) || '' }} ${{ github.event.inputs.max && format('--max={0}', github.event.inputs.max) || '' }}
 
       # --- Plan only (workflow_dispatch): show what a run WOULD do, capture nothing. ---
       - name: Show the plan
