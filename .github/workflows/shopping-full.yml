@@ -1,0 +1,182 @@
+# Shopping capture, FULL pass: every catalogue item on every live world, both sides.
+#
+# WHY THIS IS ITS OWN FILE. It used to be a second `schedule:` entry inside
+# shopping-capture.yml, with the step selected by `github.event.schedule == '7 0,6,12,18 * * *'`.
+# It never ran. Measured over 2026-07-30: exactly 12 shopping-capture runs that day, which is
+# exactly the 12 two-hourly HOT slots, and the longest shopping job in seven days was 76.7
+# minutes against the four hours a full pass needs. The four FULL slots produced no run at
+# all, `Full sweep` was reported `skipped` in every job inspected, and the only full pass in
+# the audit window (shop_runs 168) had no GitHub Actions run behind it: it was launched by
+# hand. So the pipeline's coverage guarantee was resting on someone remembering to run it.
+#
+# Two things were wrong at once and this file removes both: a workflow with several schedule
+# entries loses runs (GitHub drops scheduled events, and this repo was declaring ~190 a day
+# and getting ~50), and a step gated on a cron STRING silently does nothing the moment the
+# string and the delivered event disagree. One workflow, one schedule entry, one job that
+# only ever does one thing: there is no condition left to get wrong.
+#
+# HOW MANY PASSES, AND WHY THREE AND NOT FOUR. D1's free tier allows 100,000 row WRITES a
+# day. The one measured full pass (shop_runs 168, 2026-07-31, 240 min) wrote 17,397 rows.
+#   4 x 17,397 = 69,588, + ~12,940 rollup + ~2,000 hot/discover + ~17,000 beacon sweep
+#                                                      = 101,528 a day. Over the allowance.
+#   3 x 17,397 = 52,191 on the same basis        =  84,131 a day (84%).
+#   3 passes, with the rollup now bucketed to 4 a day (see shopping-capture.yml):
+#     52,191 + 4,312 + 2,000 + 17,100          = ~75,600 a day (76%).
+# That 17,397 is a worst case twice over: it was mostly INSERTS on a catalogue that had just
+# been fixed, and it covered essentially every trading world in one go, which a rotating pass
+# no longer does (see below). The structural expectation is ~1.1 laps of the ring a day, so
+# ~19,000 rows a day from full, and a total nearer 42%. Three passes is the number that is
+# affordable even if the worst case turns out to be the steady state.
+#
+# THE NUMBER TO RE-MEASURE is `rows_written` on a `full` run in
+# `https://boundlessinfo-api.niccolo-sabato.workers.dev/api/v2/shopping/stats`, once two
+# consecutive scheduled passes (eight hours apart on this schedule) have BOTH completed, so
+# the second one is measuring churn and not first-time inserts. Read it as rows per LAP, not
+# rows per pass: a pass now covers about 60 of 146 worlds, so a lap is about 2.7 passes and
+# 3 passes a day is about 1.1 laps a day.
+# A fourth pass becomes affordable only if a steady-state pass settles under about 19,000
+# rows (100,000 less the ~4,300 rollup, ~2,000 hot and ~17,100 beacon writes, divided by 4).
+# That ceiling rises to about 23,000 if the beacon sweep is fixed to stop re-writing ~17,000
+# unchanged rows a day, which is the single cheapest thing left on the write side.
+#
+# A PASS IS EXPECTED TO STOP AT ITS BUDGET AND THAT IS SAFE. ~1136 items x 2 sides x 146
+# worlds is ~331,700 units; at the measured 0.87 units/lane/sec on 8 lanes that is 13.2 hours,
+# which cannot fit under GitHub's hard 6-hour cap on one job however the budget is set. So a
+# pass takes a segment of about 60 worlds and stops. The ingest only ever deletes listings for
+# keys it actually verified, so a truncated pass cannot wipe anything: truncation costs
+# freshness, never correctness. What it used to cost was COVERAGE, because the queue was
+# always entered at index 0 and the tail of the ring was never reached; the bot now rotates
+# the entry point once per eight hours (`FULL_TURN_MS` in bot/src/shopping.ts), so three
+# passes a day lap the whole universe in about 0.9 days.
+#
+# REQUIRES these repository secrets:
+#   BOUNDLESS_API_KEY  the blessed Live key (shopping scope), issued by the Boundless devs
+#   INGEST_TOKEN       same value as the Worker secret
+#   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID  (optional) failure alerts
+
+name: shopping-full
+
+on:
+  schedule:
+    # Three passes a day, eight hours apart, in ONE entry: 00:07, 08:07, 16:07 UTC. One entry
+    # is deliberate. Nothing in this file inspects `github.event.schedule`, so there is no
+    # string for a delivered event to fail to match, and the job body is the same whether it
+    # arrived from the schedule or from a dispatch.
+    # The eight-hour spacing is also what bot/src/shopping.ts assumes when it advances the
+    # rotation offset (FULL_TURN_MS): change one and change the other.
+    - cron: '7 0,8,16 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  # THE SAME GROUP AS shopping-capture.yml, on purpose. A full pass and a hot pass must never
+  # run at once: they would double the load we put on the game servers and race on the same
+  # D1 rows. The cost is visible and accepted: a 5.5-hour pass blocks the two-hourly hot pass
+  # while it runs, so hot effectively gets the gaps (about 4 runs a day rather than 12). Hot
+  # is cheap and fast, and a full pass refreshes every listing it touches anyway, so the
+  # freshness lost is on worlds the running pass is not currently on.
+  group: boundless-shopping
+  cancel-in-progress: false
+
+env:
+  BOUNDLESS_API_KEY: ${{ secrets.BOUNDLESS_API_KEY }}
+  INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+  # One serial lane per world satisfies the documented one-in-flight-per-game-server rule by
+  # construction; the lanes are the throughput. No SHOP_PACE_MS on purpose: the official docs
+  # say client-side delays are not needed, and the code default (0) is the documented mode.
+  SHOP_WORLD_CONCURRENCY: '8'
+
+jobs:
+  full:
+    runs-on: ubuntu-latest
+    # GitHub caps a single job at six hours; minutes themselves are unmetered on a public
+    # repo. 350 leaves 20 minutes of slack over the 330-minute capture budget for checkout,
+    # npm install and the final ingest flush.
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install bot dependencies
+        working-directory: bot
+        # Retry transient registry errors (ECONNRESET etc.) so a network blip does not fail
+        # the sweep; only a persistent failure surfaces.
+        run: |
+          for i in 1 2 3; do
+            npm install --no-audit --no-fund --fetch-retries=5 --fetch-retry-maxtimeout=120000 && break
+            if [ "$i" -eq 3 ]; then echo "npm install failed after 3 attempts"; exit 1; fi
+            echo "npm install attempt $i failed (transient network); retrying in 15s..."
+            sleep 15
+          done
+
+      - name: Full sweep
+        working-directory: bot
+        env:
+          # 330 min. This is NOT "long enough to finish": nothing is, because a complete lap
+          # is 13.2 hours. It is the size of the segment one pass takes off the ring, and the
+          # constraint it has to satisfy is that three of them exceed one lap: 3 x 5.5 = 16.5
+          # hours against 13.2 needed, a 25% margin for sheds, 503s and slow runners. Shrink
+          # it below 265 min (3 x 4.4 = 13.2) and the ring stops lapping daily.
+          SHOP_TIME_BUDGET_MS: '19800000'
+        run: npm run shopping -- --mode=full
+
+      # --- Snapshot today's weighted-average price bands (idempotent upsert) ---
+      # Bucketed to at most one rollup per 6-hour UTC window, shared with shopping-capture.yml
+      # through the Actions cache (caches are visible to every workflow on the branch). The
+      # rationale for bucketing at all is in shopping-capture.yml; it is repeated here rather
+      # than left to the hot workflow alone because a full pass blocks hot for 5.5 hours, and
+      # the end of a pass is the best moment in the day to snapshot prices.
+      # Known and accepted: the key is computed AFTER the sweep, so a pass that crosses a
+      # bucket boundary can produce one extra rollup in a day. That is ~1,078 row writes.
+      - name: Compute the 6-hour rollup bucket
+        if: ${{ always() && job.status != 'cancelled' }}
+        id: bucket
+        # 10# forces base-10: `date +%H` is zero-padded (08, 09), which bash would otherwise
+        # parse as octal, where 8 and 9 are invalid digits.
+        run: echo "key=shopping-rollup-$(date -u +%Y%m%d)-$(( 10#$(date -u +%H) / 6 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Has this bucket already been rolled up?
+        if: ${{ always() && job.status != 'cancelled' }}
+        id: rolled
+        uses: actions/cache/restore@v4
+        with:
+          path: .rollup-marker
+          key: ${{ steps.bucket.outputs.key }}
+
+      - name: Roll up price history
+        if: ${{ always() && job.status != 'cancelled' && steps.rolled.outputs.cache-hit != 'true' }}
+        # Identical to the step in shopping-capture.yml, including why it does not pipe into
+        # `head` and why it never fails the job: see the comments there.
+        run: |
+          if body=$(curl -sS --fail -X POST "https://boundlessinfo-api.niccolo-sabato.workers.dev/api/ingest/shopping/rollup" \
+            -H "authorization: Bearer $INGEST_TOKEN" \
+            -H "content-type: application/json" \
+            -d '{}'); then
+            echo "${body:0:300}"
+            mkdir -p .rollup-marker
+            date -u > .rollup-marker/at
+          else
+            echo "rollup call failed; leaving this 6-hour bucket open so a later run retries it"
+          fi
+
+      - name: Mark this bucket rolled up
+        if: ${{ always() && job.status != 'cancelled' && steps.rolled.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .rollup-marker
+          key: ${{ steps.bucket.outputs.key }}
+
+      # --- Notify Telegram if anything above failed (best-effort, no-op if unset) ---
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            curl -sS -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+              -d chat_id="$TG_CHAT" \
+              --data-urlencode "text=Boundless shopping FULL sweep FAILED: ${{ github.workflow }} (run #${{ github.run_number }}) ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi

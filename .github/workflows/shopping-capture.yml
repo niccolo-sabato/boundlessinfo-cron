@@ -6,53 +6,58 @@
 #   INGEST_TOKEN       same value as the Worker secret
 #   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID  (optional) failure alerts
 #
-# Every run does two bounded passes:
-#   1. HOT      re-checks only the (world,item,type) triples that already hold listings, so
-#               live prices stay fresh without re-walking the whole catalogue.
-#   2. FULL, every six hours: every item on every trading world, both sides. Makes the
-#               coverage complete, and it retires DISCOVER, which existed only because a
-#               complete pass used to be unaffordable. Discovery remains dispatchable.
+# This workflow is the HOT pass only: it re-checks only the (world,item,type) triples that
+# already hold listings, so live prices stay fresh without re-walking the whole catalogue.
+# Minutes of work, a few hundred D1 row writes.
 #
-# Why discovery was not enough: 'hot' only re-reads triples that ALREADY hold a listing, and
-# discovery treated an item as "found" once it appeared anywhere, on either side of any one
-# world. Together they left most (world, item, side) combinations permanently unvisited, which
-# is why ordinary goods showed two shop stands when the game had twenty-five.
+# THE FULL PASS LIVES IN shopping-full.yml. It used to be a second `schedule:` entry in this
+# file selected by a `github.event.schedule ==` string match, and in that shape it never ran
+# once: measured 2026-07-30, exactly 12 runs that day, which is exactly the 12 hot slots.
+# Read that file before changing this one; the two share a concurrency group.
+#
+# DISCOVER is dispatch-only and is effectively retired: it existed because a complete pass
+# used to be unaffordable, and a full pass over every world does its job properly. It is kept
+# because it is the cheap way to probe a handful of cold worlds by hand.
+#
+# Why hot and discover together were never enough: 'hot' only re-reads triples that ALREADY
+# hold a listing, and discovery treated an item as "found" once it appeared anywhere, on
+# either side of any one world. Together they left most (world, item, side) combinations
+# permanently unvisited, which is why ordinary goods showed two shop stands when the game had
+# twenty-five, and why 13 permanent worlds held no listings at all.
 #
 # ENGINE CONTRACT (from the official docs, reference/boundless.docs/modding/http-shopping.rst):
 # the only rate rule is ONE request in flight per key per game server, and the docs say
 # explicitly that no client-side delaying or retrying is needed: the server regulates by
 # holding responses. The bot therefore runs one strictly serial lane per world, eight lanes at
-# a time, with no pacing. Measured sustained: ~0.87 verified units/lane/sec, so a full pass
-# over 48 trading worlds (48 x 1136 x 2 = ~109,000 units) is a shade over four hours; the hot
-# pass is minutes. Every pass stops at its time budget and simply continues next run: the
+# a time, with no pacing. Measured sustained: ~0.87 verified units/lane/sec, which makes the
+# hot pass minutes of work (it re-reads only the ~24,000 triples that hold listings) and a
+# complete pass over all 146 live worlds 13.2 hours, which is why that one lives in its own
+# file and rotates. Every pass stops at its time budget and simply continues next run: the
 # ingest only deletes listings for keys it actually verified, so an interrupted sweep is safe.
 #
-# GitHub minutes are unmetered on a public repo. The only real ceiling is the six-hour cap on
-# a single job, which is why the nightly pass is budgeted at 330 minutes under a 350-minute
-# timeout rather than being given "as long as it takes".
+# GitHub minutes are unmetered on a public repo, so no budget here exists to save minutes.
+# The budgets exist to bound a run, and the timeouts to stop a stuck one from holding the
+# concurrency group against the full pass.
 
 name: shopping-capture
 
 on:
   schedule:
     # HOT every two hours: re-reads only the triples that already hold listings, so prices
-    # stay fresh. Minutes of work.
-    - cron: '23 */2 * * *'
-    # FULL every six hours: every item on every trading world, both sides. A pass takes
-    # about four hours, so this is as close to continuous as a cron can get while leaving
-    # room for the pass to finish and for the hot pass to slip in between.
+    # stay fresh. Minutes of work. ONE schedule entry, and nothing in this file matches on
+    # `github.event.schedule`: that pairing is what made the old FULL entry a no-op.
     #
-    # For scale: BUTT cycles its catalogue in 6.6 hours against this same API. Four hours is
-    # already faster, and four passes a day means any listing is at most six hours old with
-    # the popular ones far fresher, because a busy item sits on twenty-odd worlds that are
-    # each visited at a different point in the cycle.
-    - cron: '7 0,6,12,18 * * *'
+    # In practice a full pass holds the shared concurrency group for 5.5 hours three times a
+    # day, so of these 12 slots roughly 4 actually run (the rest queue and are superseded).
+    # The 12 are kept anyway: they cost nothing when they cannot run, and they mean the gaps
+    # between full passes are used the moment they open.
+    - cron: '23 */2 * * *'
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Which pass to run'
+        description: 'Which pass to run (full lives in shopping-full.yml)'
         type: choice
-        options: [both, hot, discover, full]
+        options: [both, hot, discover]
         default: both
       shard:
         description: 'Discovery shard override (blank = derived from the clock)'
@@ -60,7 +65,8 @@ on:
 
 concurrency:
   # Never let two sweeps overlap: they would double the load we put on the game servers
-  # and race on the same D1 rows.
+  # and race on the same D1 rows. SHARED WITH shopping-full.yml, which is the whole point:
+  # splitting the full pass into its own file must not let the two run at the same time.
   group: boundless-shopping
   cancel-in-progress: false
 
@@ -76,11 +82,11 @@ env:
 jobs:
   capture:
     runs-on: ubuntu-latest
-    # GitHub caps a single job at six hours; minutes themselves are unmetered on a public
-    # repo. A complete pass is ~109,000 units at the measured ~7.5 units/sec, so about four
-    # hours: 350 minutes leaves real headroom under the cap without pretending the cap is not
-    # there.
-    timeout-minutes: 350
+    # 90, not the 350 this job carried while it still owned the full pass. Hot is budgeted at
+    # 30 minutes and discovery at another 30, and the longest shopping job in seven days was
+    # 76.7 minutes. A stuck job here holds the shared concurrency group, so an honest timeout
+    # is not tidiness: at 350 a hung hot run could swallow a whole scheduled full pass.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -101,8 +107,13 @@ jobs:
           done
 
       # --- 1. HOT: keep known listings fresh (cheap) ---
+      # Gated on the EVENT, never on a cron string. A schedule event always runs the hot pass;
+      # a dispatch runs it unless the operator picked 'discover'. The previous form compared
+      # `github.event.schedule` against a literal and compared `github.event.inputs.mode`
+      # against '' to mean "this was not a dispatch", which is two pieces of implicit
+      # knowledge about how GitHub populates contexts, and one of them was already wrong.
       - name: Hot sweep (refresh known listings)
-        if: ${{ github.event.schedule != '7 0,6,12,18 * * *' && (github.event.inputs.mode == '' || github.event.inputs.mode == 'both' || github.event.inputs.mode == 'hot') }}
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.mode == 'both' || inputs.mode == 'hot' }}
         working-directory: bot
         env:
           # 30 min. Hot only re-checks (world,item,type) triples that already hold listings:
@@ -112,38 +123,89 @@ jobs:
           SHOP_TIME_BUDGET_MS: '1800000'
         run: npm run shopping -- --mode=hot
 
-      # --- 2. DISCOVER: hunt the busiest items not yet found anywhere ---
+      # --- 2. DISCOVER: hunt the busiest items not yet found anywhere. DISPATCH ONLY. ---
+      # It was gated on `github.event.inputs.mode == 'discover' || == 'both'`, which cannot be
+      # true on a schedule event and yet fired on most scheduled runs anyway: shop_runs shows a
+      # `discover` row starting ONE SECOND after each `hot` row finishes (169/170, 166/167,
+      # 164/165). Each of those cost ~40,000 requests and ~500 seconds to write 0 to 11 rows.
+      # Now the event name is checked explicitly, so what runs on the schedule is exactly the
+      # hot pass, and discovery is what its own comment says it is: a manual probe.
       - name: Discovery sweep (busiest unfound items)
-        if: ${{ github.event.inputs.mode == 'discover' || github.event.inputs.mode == 'both' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && (inputs.mode == 'discover' || inputs.mode == 'both') }}
         working-directory: bot
         env:
           # 30 min. Discovery hunts the busiest never-found items; as the catalogue fills,
           # each run has less to do and finishes early on its own.
           SHOP_TIME_BUDGET_MS: '1800000'
-          SHOP_SHARD: ${{ github.event.inputs.shard }}
+          SHOP_SHARD: ${{ inputs.shard }}
         run: npm run shopping -- --mode=discover
 
-      # --- 3. FULL: nightly, and on demand. Every item on every trading world, both sides ---
-      - name: Full sweep
-        if: ${{ github.event.schedule == '7 0,6,12,18 * * *' || github.event.inputs.mode == 'full' }}
-        working-directory: bot
-        env:
-          # 330 min. A complete pass over 48 trading worlds is 48 x 1136 x 2 = ~109,000 units
-          # at the measured ~7.5 units/sec, so a shade over four hours. The budget has to
-          # EXCEED that or the pass is truncated every single night and the tail worlds are
-          # never reached; 330 gives an hour of slack and still sits under the job timeout.
-          SHOP_TIME_BUDGET_MS: '19800000'
-        run: npm run shopping -- --mode=full
-
       # --- Snapshot today's weighted-average price bands (idempotent upsert) ---
-      - name: Roll up price history
+      #
+      # AT MOST ONCE PER 6-HOUR UTC BUCKET, not once per job. This step ran on `always()` on
+      # all 12 daily jobs, and `rollupPriceHistory` upserts one `price_history` row per item
+      # unconditionally: 12 x ~1,078 = ~12,940 D1 row writes a day, none of them counted in
+      # any `rows_written` column, to maintain a band whose granularity is a DAY. Four a day
+      # costs ~4,312 and buys the same daily row.
+      #
+      # THE TRADE-OFF: the intraday shape of today's band is coarser for a few hours. Nothing
+      # is lost, because the rollup is an idempotent upsert of TODAY's row: whenever it next
+      # runs it recomputes that row from the current listings, so a skipped rollup leaves no
+      # gap in the history, only a slightly staler value for the current day.
+      #
+      # WHY A CACHE MARKER AND NOT A CRON. GitHub drops scheduled events wholesale here (this
+      # repo declared ~190 a day and delivered ~50), so "roll up at 00, 06, 12, 18" would
+      # simply not happen on the dropped slots. Instead every hot job asks whether its bucket
+      # has been done, and the first one that actually runs in each bucket does it. Twelve
+      # slots a day covering four buckets means a bucket has to lose every one of its chances
+      # before it loses its rollup. shopping-full.yml shares the same key namespace, so a full
+      # pass ending in an otherwise empty bucket covers it too.
+      - name: Compute the 6-hour rollup bucket
         if: ${{ always() && job.status != 'cancelled' }}
+        id: bucket
+        # 10# forces base-10: `date +%H` is zero-padded (08, 09), which bash would otherwise
+        # parse as octal, where 8 and 9 are invalid digits.
+        run: echo "key=shopping-rollup-$(date -u +%Y%m%d)-$(( 10#$(date -u +%H) / 6 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Has this bucket already been rolled up?
+        if: ${{ always() && job.status != 'cancelled' }}
+        id: rolled
+        uses: actions/cache/restore@v4
+        with:
+          path: .rollup-marker
+          key: ${{ steps.bucket.outputs.key }}
+
+      - name: Roll up price history
+        if: ${{ always() && job.status != 'cancelled' && steps.rolled.outputs.cache-hit != 'true' }}
+        # `--fail` so an HTTP 500 is a failure and not a silently swallowed body, and the
+        # marker is written ONLY on success, which is what makes the bucket self-healing. The
+        # step itself still exits 0 either way: a rollup is bookkeeping, and failing the whole
+        # capture job over it would throw away a sweep that has already been ingested.
+        # Not piped into `head`: with bash's pipefail (which Actions sets) an early-closing
+        # pipe can report the curl itself as failed, which would leave the bucket open for no
+        # reason. Truncation happens on the string instead.
         run: |
-          curl -sS -X POST "https://boundlessinfo-api.niccolo-sabato.workers.dev/api/ingest/shopping/rollup" \
+          if body=$(curl -sS --fail -X POST "https://boundlessinfo-api.niccolo-sabato.workers.dev/api/ingest/shopping/rollup" \
             -H "authorization: Bearer $INGEST_TOKEN" \
             -H "content-type: application/json" \
-            -d '{}' | head -c 300
-          echo
+            -d '{}'); then
+            echo "${body:0:300}"
+            mkdir -p .rollup-marker
+            date -u > .rollup-marker/at
+          else
+            echo "rollup call failed; leaving this 6-hour bucket open so a later run retries it"
+          fi
+
+      # Written only after the rollup actually succeeded, so a failed rollup leaves the bucket
+      # open and the next hot job retries it. A save that races another job simply warns, and
+      # a save with no marker directory to store (the failure path above) warns too and stores
+      # nothing, which is exactly the outcome wanted.
+      - name: Mark this bucket rolled up
+        if: ${{ always() && job.status != 'cancelled' && steps.rolled.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .rollup-marker
+          key: ${{ steps.bucket.outputs.key }}
 
       # --- Notify Telegram if anything above failed (best-effort, no-op if unset) ---
       - name: Notify Telegram on failure

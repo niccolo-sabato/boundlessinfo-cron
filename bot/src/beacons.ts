@@ -55,6 +55,19 @@ export interface BeaconPack {
   beacons: Beacon[];
   /** Length worldSizePlots^2. 1-based beacon index per plot column, 0 where nobody owns it. */
   owner: Uint16Array;
+  /**
+   * How many beacons the world said went missing while it was answering, i.e. how many the
+   * header promised that the walk never delivered. 0 on a clean capture.
+   *
+   * THIS FIELD EXISTS BECAUSE OF WHAT IT INVALIDATES. `beacons` is short when this is
+   * non-zero, but `owner` still uses the game's FULL 1-based numbering, so the two no longer
+   * agree: a run value can point past the end of the list we are holding. The ingest builds
+   * its owner mapping from the list we send and rejects any run value greater than its
+   * length, so shipping the grid in that state is a guaranteed 'invalid'. Measured across all
+   * 107 stored plot maps, max(run value) === owners.length exactly, every time: the check is
+   * saturated in practice, so ONE missing beacon anywhere is enough to trip it.
+   */
+  skippedBeacons: number;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -99,12 +112,22 @@ export function parseBeacons(buf: Buffer): BeaconPack {
   o += 4;
 
   const beacons: Beacon[] = [];
+  let skippedBeacons = 0;
   for (let i = 0; i < declared; i++) {
     const skipped = buf.readUInt16LE(o);
     o += 2;
     // Documented edge case: the header count is taken before the walk, so a beacon deleted
     // mid-request shows up here as "this many are missing" and the list simply ends.
-    if (skipped !== 0) break;
+    //
+    // Keep the fact instead of dropping it at the break. The column map that follows is still
+    // the game's truth and is still parsed (the offset is already past this u16, which is
+    // exactly where the map starts), but it indexes the FULL beacon list and ours is now
+    // short. Only the caller can decide what to do about that, and it cannot decide anything
+    // if the break throws the evidence away, which is what used to happen.
+    if (skipped !== 0) {
+      skippedBeacons = skipped;
+      break;
+    }
 
     const isCampfire = buf.readUInt8(o) !== 0;
     const x = buf.readInt16LE(o + 1);
@@ -147,7 +170,7 @@ export function parseBeacons(buf: Buffer): BeaconPack {
   const owner = new Uint16Array(cells);
   for (let i = 0; i < cells; i++) owner[i] = buf.readUInt16LE(o + i * 3);
 
-  return { worldSizePlots, beacons, owner };
+  return { worldSizePlots, beacons, owner, skippedBeacons };
 }
 
 /* ----------------------------- Settlements ----------------------------- */

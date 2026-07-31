@@ -1,6 +1,6 @@
 name: Poll live worlds
 
-# Runs every 10 minutes. Two detection paths, so the full live universe is current
+# Runs every 30 minutes. Two detection paths, so the full live universe is current
 # within one cycle:
 #
 #  1. PUBLIC discovery (port 8902 list-gameservers) -> permanents + public/rented
@@ -19,8 +19,25 @@ name: Poll live worlds
 # already succeed immediately). The 6-hour steam-capture remains the backstop.
 
 on:
+  # EVERY 30 MINUTES, down from every 10, and this is an increase in delivered polls, not a
+  # cut. Measured 2026-07-30: 144 runs declared, 34 delivered, a 24% delivery rate, with
+  # observed gaps on 2026-07-31 of 54, 51, 36, 44, 47, 55, 55 and 63 minutes. The real world
+  # poll cadence was already about 50 minutes; the declared 10 was fiction.
+  #
+  # GitHub drops scheduled events in proportion to how many a repository declares, and this
+  # repo was declaring ~190 a day and getting ~50. This one line was 144 of those 190, and it
+  # was starving the jobs that matter: the six-hourly full shopping sweep never ran at all.
+  # Dropping to 48 declared runs a day should deliver more of them than 144 did, at a cadence
+  # that is honest about what arrives.
+  #
+  # Nothing needs 10 minutes. The two things this poll detects are new exoworlds, which live
+  # for days, and new sovereigns, which are rented for weeks; the 6-hourly steam-capture is
+  # the backstop for both. Note that `repos/api/src/index.ts` justifies a 300 s KV cacheTtl
+  # on the grounds that "world data only changes every 10 min (poll cadence)": that premise
+  # was already false and the error is harmless (the cache is fresher than the data), but the
+  # comment there is now wrong by a wider margin.
   schedule:
-    - cron: "*/10 * * * *" # every 10 minutes
+    - cron: "*/30 * * * *" # every 30 minutes
   workflow_dispatch: {}
 
 concurrency:

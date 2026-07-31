@@ -172,6 +172,28 @@ export const EST_UNIT_MS = 1150;
 /** Immediate retries a shed (403) unit gets. Measured: a cold unit answers by the 3rd. */
 const SHED_RETRIES = 5;
 
+/**
+ * How often a scheduled FULL pass starts, milliseconds.
+ *
+ * Eight hours: three passes a day, which is what `.github/workflows/shopping-full.yml`
+ * schedules and what the D1 row-write allowance affords (the arithmetic lives in that file).
+ * Used ONLY to advance the rotation offset below, so if that schedule ever changes this
+ * constant has to change with it: too small an interval makes consecutive passes overlap
+ * (harmless, just slower to lap), too large makes them skip a segment (not harmless).
+ */
+export const FULL_TURN_MS = 8 * 60 * 60 * 1000;
+
+/**
+ * How much of the affordable segment a FULL pass advances by, as a fraction.
+ *
+ * 0.9 leaves a tenth of a segment of overlap between consecutive passes. The segment size is
+ * predicted from EST_UNIT_MS, and a pass that runs slower than that prediction (a burst of
+ * sheds, a world that answers 503 late, a slow runner) covers less than predicted. Without
+ * the overlap that shortfall is a hole in the ring that nothing ever comes back for, which is
+ * precisely the failure this rotation exists to end.
+ */
+const FULL_STRIDE_OVERLAP = 0.9;
+
 /** How a lane's single fetch resolved; drives what the worker does next. */
 type FetchOutcome =
   | { kind: "ok"; listings: ShopListing[] }
@@ -408,10 +430,13 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
   // then everything else from a rotating offset so new shop worlds are still found over
   // time without any stored cursor.
   let queue = all;
-  // DISCOVER only: hot worlds first plus a rotating handful of never-yet-trading ones.
-  // "hot" already restricts itself to known triples, and "full" must mean what it says:
-  // every world, every item. An earlier version applied this cap to "full" too, so the one
-  // mode whose entire purpose is exhaustive backfill silently skipped most cold worlds.
+  // Each mode orders the queue for itself. "hot" already restricts itself to known triples,
+  // so it needs no ordering at all; the other two do, for opposite reasons: DISCOVER has to
+  // be stopped from diluting itself across a hundred cold worlds, and FULL has to be stopped
+  // from re-scanning the same leading worlds every time. An earlier version applied the
+  // discover cap to "full" too, so the one mode whose entire purpose is exhaustive backfill
+  // silently skipped most cold worlds; that is fixed, and the rotation below is the other
+  // half of the same fix.
   if (opts.mode === "discover") {
     const known = new Set(Object.keys(opts.active ?? {}).map(Number));
     const hot = all.filter((t) => known.has(t.world.id));
@@ -432,6 +457,50 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
     // and only the cold ones needed rotating.)
     const hotOff = hot.length ? turn % hot.length : 0;
     queue = [...hot.slice(hotOff), ...hot.slice(0, hotOff), ...rotated];
+  } else if (opts.mode === "full") {
+    /*
+     * FULL means EVERY live world, and no single run can finish that, so it has to rotate.
+     *
+     * The world set was never the problem: the CLI asks our own API for every live world and
+     * keeps the ones with an apiURL, which today is 146 of 146 (50 permanent, 93 sovereign,
+     * 3 exo). Nothing is filtered by "has it ever traded". The problem was reachability.
+     *
+     * Measured: ~1136 catalogue items x 2 sides x 146 worlds = ~331,700 units. At the
+     * measured 0.87 units/lane/sec on 8 lanes that is 13.2 hours of capture, against a
+     * 5.5-hour budget under GitHub's hard 6-hour cap on a single job. So a pass reaches about
+     * 60 worlds and stops. Stopping is safe by design (the ingest only deletes listings for
+     * keys it actually verified), but only if the NEXT pass starts where this one gave up.
+     *
+     * It did not. The queue was the API's own world order, always entered at index 0, so
+     * every pass re-scanned the same leading ~60 worlds and the rest of the ring was
+     * unreachable by construction: excluded by no rule, simply never got to. That is how 13
+     * PERMANENT worlds ended up holding zero listings (Norkyna, Alcyon, Cardass, Shedu Tier,
+     * Galan, Malurialakrib, Besevrona, Alnitans, Delta Cancret, Antar VI, Minorengle, Xa
+     * Frant, Imdaari) with no way back in: HOT only re-reads triples that ALREADY hold a
+     * listing, so it can never reach a world that holds none, and DISCOVER only probes eight
+     * cold worlds a run out of ~98 candidates.
+     *
+     * So the offset advances by one segment per scheduled pass, derived from the clock in
+     * exactly the way the discover rotation above already is: no cursor to store, and a run
+     * that GitHub drops costs one segment on this lap instead of desynchronising a sequence.
+     * Three passes a day of ~60 worlds, less a 10% overlap, lap all 146 in about 0.9 days.
+     */
+    const unitsPerWorld = Math.max(
+      1,
+      Math.round(all.reduce((n, t) => n + t.work.length, 0) / Math.max(1, all.length)),
+    );
+    const fullLanes = Math.max(1, Math.min(config.shopWorldConcurrency, all.length));
+    const affordable = Math.max(
+      1,
+      Math.floor(((config.shopTimeBudgetMs / EST_UNIT_MS) * fullLanes) / unitsPerWorld),
+    );
+    const stride = Math.max(1, Math.round(affordable * FULL_STRIDE_OVERLAP));
+    const offset = all.length ? (Math.floor(Date.now() / FULL_TURN_MS) * stride) % all.length : 0;
+    queue = [...all.slice(offset), ...all.slice(0, offset)];
+    console.log(
+      `full: ${all.length} worlds in the ring, entering at #${offset} ` +
+        `(${queue[0]?.world.name ?? "?"}); a pass affords ~${affordable} worlds, stride ${stride}`,
+    );
   }
 
   const totalUnits = queue.reduce((n, t) => n + t.work.length, 0);

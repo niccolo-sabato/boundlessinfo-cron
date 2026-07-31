@@ -43,6 +43,21 @@ interface WorldRow {
   api_url: string | null;
 }
 
+/** What the ingest tells us about a world we just sent. */
+interface IngestResult {
+  rows: number;
+  /**
+   * What happened to the plot-ownership grid: 'stored', 'skipped' (we sent none) or 'invalid'
+   * (the validator refused it, with the reason in plotsError).
+   *
+   * The bot used to read `rows` and drop the rest of the response on the floor, so a rejected
+   * grid produced no log line, no D1 row and no stats field: the world simply kept whatever
+   * boundaries a previous capture had left it, indefinitely, with nothing anywhere saying so.
+   */
+  plots: "stored" | "skipped" | "invalid";
+  plotsError?: string;
+}
+
 /**
  * POST one world's sweep, retrying transient failures.
  *
@@ -51,7 +66,7 @@ interface WorldRow {
  * Worker deploy because the request reached an edge node still running the previous version,
  * which had no such route yet. Retrying rather than losing the world is obviously right.
  */
-async function postIngest(payload: string): Promise<number> {
+async function postIngest(payload: string): Promise<IngestResult> {
   let last = "";
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt) await sleep(2000 * attempt);
@@ -62,7 +77,10 @@ async function postIngest(payload: string): Promise<number> {
         body: payload,
         signal: AbortSignal.timeout(60_000),
       });
-      if (res.ok) return ((await res.json()) as { rows?: number }).rows ?? 0;
+      if (res.ok) {
+        const data = (await res.json()) as Partial<IngestResult>;
+        return { rows: data.rows ?? 0, plots: data.plots ?? "skipped", plotsError: data.plotsError };
+      }
       // 401 means the token is wrong; retrying just repeats the mistake.
       if (res.status === 401) throw new Error("ingest rejected the token (401)");
       last = `HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`;
@@ -105,6 +123,11 @@ async function main(): Promise<void> {
   let rows = 0;
   let totalBeacons = 0;
   let truncated = false;
+  // Plot-map outcomes, tallied so a sweep that stops updating boundaries is explainable from
+  // the run row rather than only from a log nobody reads.
+  let plotsStored = 0;
+  let plotsSkipped = 0;
+  let plotsInvalid = 0;
 
   for (const w of worlds) {
     if (Date.now() > deadline) {
@@ -127,6 +150,32 @@ async function main(): Promise<void> {
           `${String(settlements.length).padStart(4)} clusters`,
       );
 
+      /*
+       * SEND THE GRID ONLY IF OUR BEACON LIST IS COMPLETE.
+       *
+       * The run values in the grid are 1-based indices into the world's FULL beacon list. When
+       * the world reports beacons that went missing mid-request (pack.skippedBeacons), our
+       * list ends early while the grid does not, so it can reference a beacon we are not
+       * sending. The ingest builds its owner mapping from the list in the same payload and
+       * refuses any run value past its length, so this payload would be rejected with
+       * certainty: measured across all 107 stored plot maps, max(run value) === owners.length
+       * exactly, in every one, which means a single missing beacon is enough.
+       *
+       * So skip it, loudly. Sending it is pure waste (a 648 KB grid encoded, serialised and
+       * posted to be thrown away) and it buries the reason: the world would keep the
+       * boundaries from its last good capture with nothing saying why they stopped moving.
+       * The beacons themselves are unaffected and still go, which is the valuable half.
+       */
+      const plotsUsable = pack.skippedBeacons === 0;
+      if (!plotsUsable) {
+        console.warn(
+          `  ${w.display_name}: plot map skipped, the world dropped ${pack.skippedBeacons} ` +
+            `beacon(s) mid-request so the grid indexes ${pack.beacons.length} + ` +
+            `${pack.skippedBeacons} beacons and we only hold ${pack.beacons.length}. ` +
+            `Beacons still sent; boundaries keep the previous capture until a clean one lands.`,
+        );
+      }
+
       if (!dryRun) {
         const payload = JSON.stringify({
           worldId: w.id,
@@ -136,14 +185,26 @@ async function main(): Promise<void> {
           // false of this one: the grid is ~90% zeros in contiguous blocks, so RLE takes a
           // 648 KB grid to about 7 KB gzipped on the busiest world measured. It is what the
           // map needs to draw beacon boundaries, and there is no other source for it.
-          plotRuns: encodePlotRuns(pack.owner),
+          // Omitted entirely (not sent empty) when the beacon list is short: the endpoint
+          // treats an absent plotRuns as "this bot has nothing to say about the grid" and
+          // leaves the stored one alone, which is the behaviour we want here.
+          ...(plotsUsable ? { plotRuns: encodePlotRuns(pack.owner) } : {}),
           beacons: pack.beacons,
           settlements: settlements.map((s) => ({
             name: s.name, mayor: s.mayor, prestige: s.prestige, beacons: s.beacons,
             plots: s.plots, x: s.x, y: s.y, z: s.z,
           })),
         });
-        rows += await postIngest(payload);
+        const result = await postIngest(payload);
+        rows += result.rows;
+        if (result.plots === "stored") plotsStored++;
+        else if (result.plots === "invalid") {
+          plotsInvalid++;
+          // The one case nobody could see before. It means the grid and the beacon list
+          // disagreed for a reason we have NOT accounted for above, so print the validator's
+          // own words rather than a guess.
+          console.warn(`  ${w.display_name}: plot map REJECTED: ${result.plotsError ?? "no reason given"}`);
+        } else plotsSkipped++;
       }
     } catch (err) {
       if (err instanceof BeaconKeyError) {
@@ -158,11 +219,17 @@ async function main(): Promise<void> {
   }
 
   const mins = ((Date.now() - started) / 60000).toFixed(1);
+  // The plot tally is its own line rather than more commas on the first one: it answers a
+  // different question (are the map boundaries still being updated?) from the beacon counts,
+  // and it was the question nothing answered at all.
+  const plotNote =
+    `plot maps: ${plotsStored} stored, ${plotsSkipped} not sent, ${plotsInvalid} rejected`;
   console.log(
     `\ndone in ${mins} min: ${done} worlds, ${totalBeacons.toLocaleString()} beacons, ` +
       `${rows.toLocaleString()} rows written, ${skipped} skipped, ${errors} errors` +
       (truncated ? " (time budget reached)" : ""),
   );
+  if (!dryRun) console.log(`  ${plotNote}`);
 
   if (runId) {
     await fetch(`${config.apiBase}/api/ingest/beacons/run`, {
@@ -170,7 +237,10 @@ async function main(): Promise<void> {
       headers: { "content-type": "application/json", authorization: `Bearer ${config.ingestToken}` },
       body: JSON.stringify({
         action: "finish", id: runId, worlds: done, beacons: totalBeacons, rows, errors,
-        note: truncated ? "time budget reached" : "ok",
+        // Folded into the note because `beacon_runs` has no column for it. A rejected or
+        // un-sent grid is now visible in the admin dashboard's run list instead of only in a
+        // job log that expires.
+        note: (truncated ? "time budget reached" : "ok") + `; ${plotNote}`,
       }),
       signal: AbortSignal.timeout(20_000),
     }).catch(() => {});

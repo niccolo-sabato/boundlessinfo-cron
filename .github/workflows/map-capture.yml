@@ -18,10 +18,12 @@
 # a planet that no longer exists would put every shop marker on meaningless ground.
 #
 # Two modes. 'new' only maps worlds we hold nothing for. 'refresh' does that FIRST and then
-# re-captures stale maps, so it is a superset and is what the schedule runs: with 'new' on the
-# schedule the job silently becomes a no-op the moment the backlog drains, and every map ages
-# forever. Unmapped worlds always outrank stale ones, so a new sovereign or a fresh nexus is
-# still picked up ahead of any refresh.
+# re-captures stale maps, so it is a superset and is what the twice-daily pass runs: with
+# 'new' alone the job silently becomes a no-op the moment the backlog drains, and every map
+# ages forever. Unmapped worlds always outrank stale ones, so a new sovereign or a fresh nexus
+# is still picked up ahead of any refresh. Measured 2026-07-31, and the reason the 'new' pass
+# dropped from hourly to six-hourly: the backlog is drained (145 of 146 worlds mapped), so 9
+# of the last 10 'new' runs did nothing at all.
 #
 # Every world is re-captured after MAP_REFRESH_DAYS (7). Measured over 145 real captures the
 # median takes 5.5 minutes, so a complete pass over the universe is 18.2 hours of capture time
@@ -42,11 +44,18 @@ on:
     # comfortably inside a month afterwards.
     # The long pass, twice a day: drains any backlog, then refreshes what has gone stale.
     - cron: '41 3,15 * * *'
-    # HOURLY sweep for worlds we hold no map for. Exos live for days and sovereigns appear at
-    # any hour, so "within the hour" is the difference between a usable map and a planet that
-    # is gone before we drew it. Costs one call to our own coverage endpoint and exits in
-    # about fifteen seconds when there is nothing new, which is most of the time.
-    - cron: '11 * * * *'
+    # SIX-HOURLY sweep for worlds we hold no map for. This was hourly, and hourly has stopped
+    # earning its place: the backlog it was written to drain IS drained (145 of 146 live
+    # worlds are mapped), so 9 of the last 10 runs reported worlds_done 0, bytes_written 0 and
+    # exited in 12 to 25 seconds. It is a green scheduled job that does nothing, which is the
+    # exact failure mode this pipeline is meant to be watched for.
+    #
+    # It cost little in itself, but it declared 24 scheduled runs a day in a repo that was
+    # declaring ~190 and getting ~50 delivered, and those drops were falling on jobs that had
+    # real work to do. At 4 a day, and interleaved with the twice-daily refresh (which does
+    # unmapped worlds FIRST, so it is a superset of this mode), no new world waits more than
+    # about six hours for its first map. Exos live for days, so that is well inside the window.
+    - cron: '11 */6 * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -106,8 +115,12 @@ jobs:
         env:
           # The short new-only sweeps get a small budget (about four worlds); the twice-daily
           # pass gets five hours. A manual dispatch uses whatever it asks for.
-          MAP_TIME_BUDGET_MS: ${{ github.event.schedule == '11 * * * *' && '3000000' || '18000000' }}
-        run: npm run maps -- --mode=${{ github.event.inputs.mode || (github.event.schedule == '11 * * * *' && 'new' || 'refresh') }} ${{ github.event.inputs.worlds && format('--worlds={0}', github.event.inputs.worlds) || '' }} ${{ github.event.inputs.max && format('--max={0}', github.event.inputs.max) || '' }}
+          # BOTH of these match on the cron STRING, so the literal has to be kept in step with
+          # the `schedule:` block above, in both places. A mismatch here does not fail: it
+          # silently swaps the mode and the budget, which is the same class of bug that left
+          # the full shopping sweep never running for a week.
+          MAP_TIME_BUDGET_MS: ${{ github.event.schedule == '11 */6 * * *' && '3000000' || '18000000' }}
+        run: npm run maps -- --mode=${{ github.event.inputs.mode || (github.event.schedule == '11 */6 * * *' && 'new' || 'refresh') }} ${{ github.event.inputs.worlds && format('--worlds={0}', github.event.inputs.worlds) || '' }} ${{ github.event.inputs.max && format('--max={0}', github.event.inputs.max) || '' }}
 
       # --- Plan only (workflow_dispatch): show what a run WOULD do, capture nothing. ---
       - name: Show the plan
