@@ -9,27 +9,44 @@
 # Every run does two bounded passes:
 #   1. HOT      re-checks only the (world,item,type) triples that already hold listings, so
 #               live prices stay fresh without re-walking the whole catalogue.
-#   2. DISCOVER hunts the most-traded items we have never found anywhere, ordered by real
-#               trade volume rather than by an arbitrary slice of the id space.
+#   2. FULL, nightly: every item on every trading world, both sides. This is what makes the
+#               coverage complete, and it retires DISCOVER, which existed only because a
+#               complete pass used to be unaffordable. Discovery remains dispatchable.
+#
+# Why discovery was not enough: 'hot' only re-reads triples that ALREADY hold a listing, and
+# discovery treated an item as "found" once it appeared anywhere, on either side of any one
+# world. Together they left most (world, item, side) combinations permanently unvisited, which
+# is why ordinary goods showed two shop stands when the game had twenty-five.
 #
 # ENGINE CONTRACT (from the official docs, reference/boundless.docs/modding/http-shopping.rst):
 # the only rate rule is ONE request in flight per key per game server, and the docs say
 # explicitly that no client-side delaying or retrying is needed: the server regulates by
 # holding responses. The bot therefore runs one strictly serial lane per world, eight lanes at
 # a time, with no pacing. Measured sustained: ~0.87 verified units/lane/sec, so a full pass
-# over the traded catalogue (~78k units) is about three hours; the hot pass is minutes.
-# Both passes stop at their time budget and simply continue next run: the ingest only
-# deletes listings for keys it actually verified, so an interrupted sweep is always safe.
+# over 48 trading worlds (48 x 1136 x 2 = ~109,000 units) is a shade over four hours; the hot
+# pass is minutes. Every pass stops at its time budget and simply continues next run: the
+# ingest only deletes listings for keys it actually verified, so an interrupted sweep is safe.
+#
+# GitHub minutes are unmetered on a public repo. The only real ceiling is the six-hour cap on
+# a single job, which is why the nightly pass is budgeted at 330 minutes under a 350-minute
+# timeout rather than being given "as long as it takes".
 
 name: shopping-capture
 
 on:
   schedule:
-    - cron: '23 */2 * * *' # every 2 hours, off the :00 mark
+    # HOT every two hours: re-reads only the triples that already hold listings, so prices
+    # stay fresh. Minutes of work.
+    - cron: '23 */2 * * *'
+    # FULL once a day, in the quiet hours: every item on every trading world, both sides.
+    # This is what makes coverage COMPLETE rather than "whatever we happened to find", and
+    # it is the pass that retires discovery: an item is no longer "found" or "unfound", every
+    # (world, item, side) is simply visited.
+    - cron: '7 2 * * *'
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Which pass to run (both = hot then discover)'
+        description: 'Which pass to run'
         type: choice
         options: [both, hot, discover, full]
         default: both
@@ -55,7 +72,11 @@ env:
 jobs:
   capture:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    # GitHub caps a single job at six hours; minutes themselves are unmetered on a public
+    # repo. A complete pass is ~109,000 units at the measured ~7.5 units/sec, so about four
+    # hours: 350 minutes leaves real headroom under the cap without pretending the cap is not
+    # there.
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -77,7 +98,7 @@ jobs:
 
       # --- 1. HOT: keep known listings fresh (cheap) ---
       - name: Hot sweep (refresh known listings)
-        if: ${{ github.event.inputs.mode == '' || github.event.inputs.mode == 'both' || github.event.inputs.mode == 'hot' }}
+        if: ${{ github.event.schedule != '7 2 * * *' && (github.event.inputs.mode == '' || github.event.inputs.mode == 'both' || github.event.inputs.mode == 'hot') }}
         working-directory: bot
         env:
           # 30 min. Hot only re-checks (world,item,type) triples that already hold listings:
@@ -89,7 +110,7 @@ jobs:
 
       # --- 2. DISCOVER: hunt the busiest items not yet found anywhere ---
       - name: Discovery sweep (busiest unfound items)
-        if: ${{ github.event.inputs.mode == '' || github.event.inputs.mode == 'both' || github.event.inputs.mode == 'discover' }}
+        if: ${{ github.event.inputs.mode == 'discover' || github.event.inputs.mode == 'both' }}
         working-directory: bot
         env:
           # 30 min. Discovery hunts the busiest never-found items; as the catalogue fills,
@@ -98,15 +119,16 @@ jobs:
           SHOP_SHARD: ${{ github.event.inputs.shard }}
         run: npm run shopping -- --mode=discover
 
-      # --- Manual full sweep (workflow_dispatch only): every item on every world ---
+      # --- 3. FULL: nightly, and on demand. Every item on every trading world, both sides ---
       - name: Full sweep
-        if: ${{ github.event.inputs.mode == 'full' }}
+        if: ${{ github.event.schedule == '7 2 * * *' || github.event.inputs.mode == 'full' }}
         working-directory: bot
         env:
-          # 210 min. A complete pass is ~78,000 units at the measured ~7 units/sec on 8
-          # lanes, about three hours; this step runs alone (manual dispatch) so it has the
-          # whole job to itself.
-          SHOP_TIME_BUDGET_MS: '12600000'
+          # 330 min. A complete pass over 48 trading worlds is 48 x 1136 x 2 = ~109,000 units
+          # at the measured ~7.5 units/sec, so a shade over four hours. The budget has to
+          # EXCEED that or the pass is truncated every single night and the tail worlds are
+          # never reached; 330 gives an hour of slack and still sits under the job timeout.
+          SHOP_TIME_BUDGET_MS: '19800000'
         run: npm run shopping -- --mode=full
 
       # --- Snapshot today's weighted-average price bands (idempotent upsert) ---
