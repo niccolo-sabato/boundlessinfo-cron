@@ -83,7 +83,7 @@ async function main(): Promise<void> {
     // Only affects ordering, never correctness.
   }
 
-  const opts = { mode, worlds, coverage: cov.worlds, shopWorlds, maxWorlds };
+  const opts = { mode, worlds, coverage: cov.worlds, shopWorlds, maxWorlds, force };
 
   // Thumbnails arrived after the first captures. Backfilling them re-uses the images we
   // already stored rather than asking the game servers again, so it costs seconds a world
