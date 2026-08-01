@@ -162,6 +162,7 @@ async function main(): Promise<void> {
       mode: effectiveMode,
       worlds,
       itemIds,
+      itemFilter,
       active,
       shard: effectiveShard,
       shards,

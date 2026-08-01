@@ -310,6 +310,16 @@ export interface CaptureOptions {
   worlds: CaptureWorld[];
   /** Full catalogue of item game ids (used by discover/full). */
   itemIds: number[];
+  /**
+   * An explicit `--items=` list, when the caller named one.
+   *
+   * Distinct from `itemIds`, which is the whole catalogue whenever no filter was given, and
+   * that distinction is the point: "hot" builds its work from the triples already known to
+   * trade rather than from `itemIds`, so a named item had NO effect on it. Asking the admin
+   * panel to re-read one item on one world re-read the entire world instead: 561 units and
+   * five minutes, for a question that is two requests.
+   */
+  itemFilter?: number[];
   /** Active (world -> {S,B} item ids) from our API, used by the "hot" mode. */
   active?: Record<string, { S: number[]; B: number[] }>;
   shard?: number;
@@ -348,10 +358,15 @@ export interface CaptureOptions {
  * for years; it is used only to decide what we look at first, never as data we serve.
  */
 function buildWork(opts: CaptureOptions, world: CaptureWorld): string[] {
+  // A named list narrows every mode, including "hot", which otherwise ignores it.
+  const only = opts.itemFilter?.length ? new Set(opts.itemFilter) : null;
+
   if (opts.mode === "hot") {
     const a = opts.active?.[String(world.id)];
     if (!a) return [];
-    return [...a.S.map((i) => `${i}:S`), ...a.B.map((i) => `${i}:B`)];
+    const S = only ? a.S.filter((i) => only.has(i)) : a.S;
+    const B = only ? a.B.filter((i) => only.has(i)) : a.B;
+    return [...S.map((i) => `${i}:S`), ...B.map((i) => `${i}:B`)];
   }
 
   let items = opts.itemIds;
@@ -399,7 +414,10 @@ function buildWork(opts: CaptureOptions, world: CaptureWorld): string[] {
   }
 
   const work: string[] = [];
-  for (const id of items) work.push(`${id}:S`, `${id}:B`);
+  for (const id of items) {
+    if (only && !only.has(id)) continue;
+    work.push(`${id}:S`, `${id}:B`);
+  }
   return work;
 }
 
