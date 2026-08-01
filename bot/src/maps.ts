@@ -51,6 +51,15 @@ export interface MapCaptureStats {
 export interface MapCaptureOptions {
   /** 'new' only maps worlds we hold nothing for; 'refresh' also re-captures stale ones. */
   mode: "new" | "refresh";
+  /**
+   * Capture the named worlds whatever their age.
+   *
+   * Only meaningful together with an explicit world list, and the CLI enforces that. The
+   * seven-day rule is right for the scheduled sweep and wrong for a person who has just
+   * watched a build go up and wants to see it on the map: asking for one world by name is
+   * already the statement that it should be re-read.
+   */
+  force?: boolean;
   worlds: MapWorld[];
   /** world id -> what we already hold, from /api/v2/maps/coverage. */
   coverage: Record<string, { at: number; source: string; thumb?: boolean }>;
@@ -174,6 +183,14 @@ export function planMapWork(opts: MapCaptureOptions): Job[] {
       continue;
     }
     if (opts.mode !== "refresh") continue;
+    if (opts.force) {
+      jobs.push({
+        world: w,
+        priority: hasShops ? 3 : 4,
+        why: `forced, ${Math.round((now - held.at) / 86400)} days old`,
+      });
+      continue;
+    }
     if (now - held.at > staleAfter) {
       jobs.push({
         world: w,

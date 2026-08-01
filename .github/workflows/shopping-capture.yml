@@ -62,6 +62,12 @@ on:
       shard:
         description: 'Discovery shard override (blank = derived from the clock)'
         default: ''
+      worlds:
+        description: 'Comma-separated world ids to scan (blank = the planner decides)'
+        default: ''
+      items:
+        description: 'Comma-separated item ids to scan (blank = the whole catalogue)'
+        default: ''
 
 concurrency:
   # Never let two sweeps overlap: they would double the load we put on the game servers
@@ -121,7 +127,10 @@ jobs:
           # is headroom, not the expected duration; worlds rotate between runs so a truncated
           # tail is picked up next time.
           SHOP_TIME_BUDGET_MS: '1800000'
-        run: npm run shopping -- --mode=hot
+        # The two filters are what makes a targeted read possible: one world, one item, or
+        # both, without waiting for the ring to come round. They are empty on a schedule, so
+        # the sweep is unchanged.
+        run: npm run shopping -- --mode=hot ${{ inputs.worlds && format('--worlds={0}', inputs.worlds) || '' }} ${{ inputs.items && format('--items={0}', inputs.items) || '' }}
 
       # --- 2. DISCOVER: hunt the busiest items not yet found anywhere. DISPATCH ONLY. ---
       # It was gated on `github.event.inputs.mode == 'discover' || == 'both'`, which cannot be

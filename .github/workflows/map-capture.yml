@@ -69,6 +69,10 @@ on:
       max:
         description: 'Maximum worlds this run may capture'
         default: ''
+      force:
+        description: 'Re-capture the named worlds whatever their age (needs "worlds")'
+        type: boolean
+        default: false
       dry_run:
         description: 'Print the plan and stop'
         type: boolean
@@ -120,7 +124,11 @@ jobs:
           # silently swaps the mode and the budget, which is the same class of bug that left
           # the full shopping sweep never running for a week.
           MAP_TIME_BUDGET_MS: ${{ github.event.schedule == '11 */6 * * *' && '3000000' || '18000000' }}
-        run: npm run maps -- --mode=${{ github.event.inputs.mode || (github.event.schedule == '11 */6 * * *' && 'new' || 'refresh') }} ${{ github.event.inputs.worlds && format('--worlds={0}', github.event.inputs.worlds) || '' }} ${{ github.event.inputs.max && format('--max={0}', github.event.inputs.max) || '' }}
+        # `force` exists because the scheduled sweep's seven-day staleness rule is right for
+        # the sweep and wrong for a person: asking for one world by name is already the
+        # statement that it should be re-read. The bot refuses to force without a world list,
+        # so this cannot turn into a re-capture of all 145 worlds by accident.
+        run: npm run maps -- --mode=${{ github.event.inputs.mode || (github.event.schedule == '11 */6 * * *' && 'new' || 'refresh') }} ${{ github.event.inputs.worlds && format('--worlds={0}', github.event.inputs.worlds) || '' }} ${{ github.event.inputs.max && format('--max={0}', github.event.inputs.max) || '' }} ${{ github.event.inputs.force == 'true' && '--force' || '' }}
 
       # --- Plan only (workflow_dispatch): show what a run WOULD do, capture nothing. ---
       - name: Show the plan

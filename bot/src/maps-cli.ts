@@ -40,6 +40,12 @@ async function main(): Promise<void> {
   const mode = (arg("mode") ?? process.env.MAP_MODE ?? "new") as "new" | "refresh";
   if (!["new", "refresh"].includes(mode)) throw new Error(`unknown mode ${mode}`);
   const worldFilter = arg("worlds")?.split(",").map(Number).filter(Number.isFinite);
+  // Forcing is only allowed for a named list. Without that guard a stray flag would re-capture
+  // all 145 worlds, which is twelve minutes each and would eat the R2 budget in one run.
+  const force = hasFlag("force") || process.env.MAP_FORCE === "true";
+  if (force && !worldFilter?.length) {
+    throw new Error("--force needs --worlds=<ids>: refusing to re-capture every world at once");
+  }
   const maxWorlds = Number(arg("max") ?? config.mapMaxPerRun);
 
   const worldRows = (await getJson<{ results: WorldRow[] }>(`${config.apiBase}/api/v2/worlds?limit=500`)).results;
