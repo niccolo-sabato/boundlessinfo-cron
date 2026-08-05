@@ -144,10 +144,15 @@ async function main(): Promise<void> {
   }
 
   // Sovereign and exo worlds expire. Their maps would otherwise sit in the bucket forever,
-  // spending the budget that live worlds need, so every run hands over the current world list
-  // and lets the server drop whatever is no longer in it. The server refuses to act on an
-  // implausibly short list, and this is skipped outright when the run was filtered to a few
-  // worlds, because that list is not the universe.
+  // spending the budget that live worlds need, so every run hands the current listing over and
+  // asks the server to release what is finished.
+  //
+  // We hand over the listing; we do NOT decide from it. A Sovereign drops out of the listing the
+  // moment its rental lapses and can still be extended for a fortnight after that, so "absent
+  // from this list" is not "dead" and this side has no way to tell the difference. The server
+  // holds the lifetimes and makes that call. It still refuses to act on an implausibly short
+  // list, and this is skipped outright when the run was filtered to a few worlds, because that
+  // list is not the universe.
   if (!worldFilter?.length) {
     try {
       const res = await fetch(`${config.apiBase}/api/ingest/map/prune`, {
@@ -156,9 +161,12 @@ async function main(): Promise<void> {
         body: JSON.stringify({ live: worldRows.map((w) => w.id) }),
         signal: AbortSignal.timeout(60_000),
       });
-      const out = (await res.json()) as { pruned?: number[]; skipped?: string };
+      const out = (await res.json()) as { pruned?: number[]; failed?: number[]; skipped?: string };
       if (out.skipped) console.log(`prune skipped: ${out.skipped}`);
-      else if (out.pruned?.length) console.log(`pruned ${out.pruned.length} maps of worlds that have left the universe`);
+      else if (out.pruned?.length) console.log(`released ${out.pruned.length} maps of worlds that are closed for good`);
+      // A partial failure leaves the index row in place so the next sweep retries, but it is
+      // still worth saying out loud: a world failing every time is a fault, not a hiccup.
+      if (out.failed?.length) console.warn(`prune could not release ${out.failed.length}: ${out.failed.join(", ")}`);
     } catch (err) {
       console.warn(`prune failed (harmless, retried next run): ${(err as Error).message}`);
     }
