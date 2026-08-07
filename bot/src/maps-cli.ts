@@ -161,8 +161,12 @@ async function main(): Promise<void> {
         body: JSON.stringify({ live: worldRows.map((w) => w.id) }),
         signal: AbortSignal.timeout(60_000),
       });
-      const out = (await res.json()) as { pruned?: number[]; failed?: number[]; skipped?: string };
-      if (out.skipped) console.log(`prune skipped: ${out.skipped}`);
+      const out = (await res.json()) as { pruned?: number[]; failed?: number[]; skipped?: string; detail?: string };
+      // A refusal is a 503 with a `detail`, and fetch does not throw on it. Without this check
+      // the run printed nothing and exited 0, so "the server refused to prune because it could
+      // not read the world history" looked exactly like "there was nothing to release".
+      if (!res.ok) console.warn(`prune refused (${res.status}): ${out.detail ?? "no detail"}`);
+      else if (out.skipped) console.log(`prune skipped: ${out.skipped}`);
       else if (out.pruned?.length) console.log(`released ${out.pruned.length} maps of worlds that are closed for good`);
       // A partial failure leaves the index row in place so the next sweep retries, but it is
       // still worth saying out loud: a world failing every time is a fault, not a hiccup.
