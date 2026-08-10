@@ -18,6 +18,7 @@
 
 import { config } from "./config.ts";
 import { captureShopping, EST_UNIT_MS, ShopKeyError, type CaptureWorld } from "./shopping.ts";
+import { postIngest, getJson, jsonObject, describeFailure } from "./http.ts";
 
 const SITE_DATA = process.env.SITE_DATA_BASE ?? "https://boundlessinfo.pages.dev/data";
 
@@ -27,16 +28,10 @@ function arg(name: string): string | undefined {
 }
 const hasFlag = (name: string) => process.argv.slice(2).includes(`--${name}`);
 
-async function getJson<T>(url: string): Promise<T> {
-  const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
-  if (!res.ok) throw new Error(`GET ${url} -> HTTP ${res.status}`);
-  return (await res.json()) as T;
-}
-
 /** Live worlds with an apiURL, from our own public API (single source of truth). */
 async function loadWorlds(): Promise<CaptureWorld[]> {
   const data = await getJson<{ results: { id: number; api_url: string | null; display_name: string | null }[] }>(
-    `${config.apiBase}/api/v2/worlds?limit=500`,
+    "/api/v2/worlds?limit=500",
   );
   return data.results
     .filter((w) => typeof w.api_url === "string" && w.api_url)
@@ -93,7 +88,7 @@ async function main(): Promise<void> {
   try {
     active = (
       await getJson<{ worlds: Record<string, { S: number[]; B: number[] }> }>(
-        `${config.apiBase}/api/v2/shopping/active`,
+        "/api/v2/shopping/active",
       )
     ).worlds ?? {};
   } catch {
@@ -111,19 +106,15 @@ async function main(): Promise<void> {
       (effectiveMode === "discover" ? ` | shard ${effectiveShard}/${shards}` : ""),
   );
 
-  // Open an audit row so a run that dies is still visible in the admin dashboard.
-  let runId = 0;
-  try {
-    const res = await fetch(`${config.apiBase}/api/ingest/shopping/run`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${config.ingestToken}` },
-      body: JSON.stringify({ action: "start", mode: effectiveMode }),
-      signal: AbortSignal.timeout(20_000),
-    });
-    if (res.ok) runId = ((await res.json()) as { id?: number }).id ?? 0;
-  } catch {
-    // Auditing is best-effort: never block a capture because the bookkeeping call failed.
-  }
+  // Open an audit row so a run that dies is still visible in the admin dashboard. Best-effort
+  // and deliberately NOT retried: the start INSERTs a row and returns its id, so a retry after
+  // a timeout can leave a second row nobody will ever close.
+  const startRes = await postIngest(
+    "/api/ingest/shopping/run",
+    { action: "start", mode: effectiveMode },
+    { attempts: 1 },
+  );
+  const runId = jsonObject<{ id?: number }>(startRes)?.id ?? 0;
 
   const started = Date.now();
   let note = "";
@@ -195,18 +186,15 @@ async function main(): Promise<void> {
         ? `ok (${stats.ingestErrors} ingest failures)`
         : "ok";
     if (runId) {
-      await fetch(`${config.apiBase}/api/ingest/shopping/run`, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${config.ingestToken}` },
-        body: JSON.stringify({
-          action: "finish", id: runId, worlds: stats.worldsDone, requests: stats.requests,
-          listings: stats.listings, rows: stats.rowsWritten,
-          // errors = units left unverified; ingest failures are a different animal (verified
-          // but unwritten) and would otherwise hide behind a green run in the dashboard.
-          errors: stats.errors + stats.ingestErrors, note,
-        }),
-        signal: AbortSignal.timeout(20_000),
-      }).catch(() => {});
+      // Retried, unlike the start: this updates the row by id, so repeating it is a no-op,
+      // and a sweep left open in the dashboard reads as a crash that never happened.
+      await postIngest("/api/ingest/shopping/run", {
+        action: "finish", id: runId, worlds: stats.worldsDone, requests: stats.requests,
+        listings: stats.listings, rows: stats.rowsWritten,
+        // errors = units left unverified; ingest failures are a different animal (verified
+        // but unwritten) and would otherwise hide behind a green run in the dashboard.
+        errors: stats.errors + stats.ingestErrors, note,
+      });
     }
   } catch (err) {
     if (err instanceof ShopKeyError) {
@@ -218,13 +206,14 @@ async function main(): Promise<void> {
   }
 
   if (hasFlag("rollup")) {
-    const res = await fetch(`${config.apiBase}/api/ingest/shopping/rollup`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${config.ingestToken}` },
-      body: JSON.stringify({}),
-      signal: AbortSignal.timeout(60_000),
-    });
-    console.log(`rollup: HTTP ${res.status} ${(await res.text()).slice(0, 120)}`);
+    const res = await postIngest("/api/ingest/shopping/rollup", {}, { timeoutMs: 60_000 });
+    if (res.ok) console.log(`rollup: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 120)}`);
+    // The rollup is what feeds the item pages' price summaries. It used to print its status
+    // and move on whatever it was, so a failing rollup was one grey line in a green job.
+    else {
+      console.error(`rollup FAILED: ${describeFailure(res)}`);
+      process.exitCode = 1;
+    }
   }
 }
 

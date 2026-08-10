@@ -62,7 +62,7 @@ async function main() {
   for (const [label, uname, ct] of candidates) {
     const fresh = await fetchWorld(token, worldId); // fresh pollData per attempt
     const body = packPollBody(uname, token.player.id, fresh.pollData);
-    const headers = ct ? { "content-type": ct } : {};
+    const headers: Record<string, string> = ct ? { "content-type": ct } : {};
     await probePoll(`${label} (uname="${uname}")`, fresh.worldData.apiURL, body, headers);
   }
 

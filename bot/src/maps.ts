@@ -26,6 +26,7 @@
 
 import { config } from "./config.ts";
 import { decodePng, decodeTga, downscale, encodePng, type Raster } from "./image.ts";
+import { postIngest, postIngestBinary, describeFailure } from "./http.ts";
 import { gunzipSync } from "node:zlib";
 
 export interface MapWorld {
@@ -112,33 +113,38 @@ async function fetchLod0(world: MapWorld): Promise<Raster> {
 
 /* ----------------------------- Upload ----------------------------- */
 
+/*
+ * Both uploads retry, because of what they cost. A LOD0 capture is twelve minutes of a game
+ * server's time and about thirty of a run's budget once decoding and rescaling are counted,
+ * and until this change a single blip on OUR side discarded all of it and counted the world as
+ * an error. Repeating is safe: the blob is written to a fixed R2 key and the record upserts on
+ * world id, so the second attempt overwrites the first with the identical bytes.
+ *
+ * 507 is the exception the shared helper knows about: the storage cap is a decision, not a
+ * hiccup, and re-posting the same megabyte cannot make room.
+ */
 async function putBlob(
   worldId: number,
   variant: "full" | "overview" | "thumb",
   png: Buffer,
 ): Promise<number> {
-  const res = await fetch(`${config.apiBase}/api/ingest/map/blob?world=${worldId}&variant=${variant}`, {
-    method: "POST",
-    headers: { "content-type": "image/png", authorization: `Bearer ${config.ingestToken}` },
-    body: png,
-    signal: AbortSignal.timeout(180_000),
-  });
+  const res = await postIngestBinary(
+    `/api/ingest/map/blob?world=${worldId}&variant=${variant}`,
+    png,
+    "image/png",
+    { attempts: 3, timeoutMs: 180_000, backoffMs: [2_000, 5_000] },
+  );
   if (res.status === 507) {
-    const body = (await res.json().catch(() => ({}))) as { detail?: string };
+    const body = (res.body ?? {}) as { detail?: string };
     throw new MapCapError(`storage cap reached: ${body.detail ?? "no detail"}`);
   }
-  if (!res.ok) throw new Error(`blob upload HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  if (!res.ok) throw new Error(`blob upload ${describeFailure(res)}`);
   return png.length;
 }
 
 async function putRecord(rec: Record<string, unknown>): Promise<void> {
-  const res = await fetch(`${config.apiBase}/api/ingest/map`, {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${config.ingestToken}` },
-    body: JSON.stringify(rec),
-    signal: AbortSignal.timeout(30_000),
-  });
-  if (!res.ok) throw new Error(`index upsert HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const res = await postIngest("/api/ingest/map", rec, { timeoutMs: 30_000 });
+  if (!res.ok) throw new Error(`index upsert ${describeFailure(res)}`);
 }
 
 /* ----------------------------- Planning ----------------------------- */

@@ -14,18 +14,13 @@
 
 import { config } from "./config.ts";
 import { backfillThumbs, captureMaps, planMapWork, type MapWorld } from "./maps.ts";
+import { postIngest, getJson, jsonObject, describeFailure } from "./http.ts";
 
 function arg(name: string): string | undefined {
   const hit = process.argv.slice(2).find((a) => a.startsWith(`--${name}=`));
   return hit ? hit.slice(name.length + 3) : undefined;
 }
 const hasFlag = (name: string) => process.argv.slice(2).includes(`--${name}`);
-
-async function getJson<T>(url: string): Promise<T> {
-  const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
-  if (!res.ok) throw new Error(`GET ${url} -> HTTP ${res.status}`);
-  return (await res.json()) as T;
-}
 
 interface WorldRow {
   id: number;
@@ -48,7 +43,7 @@ async function main(): Promise<void> {
   }
   const maxWorlds = Number(arg("max") ?? config.mapMaxPerRun);
 
-  const worldRows = (await getJson<{ results: WorldRow[] }>(`${config.apiBase}/api/v2/worlds?limit=500`)).results;
+  const worldRows = (await getJson<{ results: WorldRow[] }>("/api/v2/worlds?limit=500")).results;
   let worlds: MapWorld[] = worldRows.map((w) => ({
     id: w.id,
     name: w.name,
@@ -60,9 +55,12 @@ async function main(): Promise<void> {
   if (worldFilter?.length) worlds = worlds.filter((w) => worldFilter.includes(w.id));
 
   const cov = await getJson<{
-    worlds: Record<string, { at: number; source: string }>;
+    // `thumb` was missing here while the code below read it. Nothing broke, because getJson is
+    // an unchecked cast, but the type was lying: the endpoint has returned it since thumbnails
+    // were added (see mapCoverage in the API).
+    worlds: Record<string, { at: number; source: string; thumb: boolean }>;
     budget: { worlds: number; bytes: number; capWorlds: number; capBytes: number; full: boolean };
-  }>(`${config.apiBase}/api/v2/maps/coverage`);
+  }>("/api/v2/maps/coverage");
 
   console.log(
     `storage: ${cov.budget.worlds}/${cov.budget.capWorlds} worlds, ` +
@@ -77,7 +75,7 @@ async function main(): Promise<void> {
   // Shops are why the maps exist, so worlds that trade are captured first.
   let shopWorlds = new Set<number>();
   try {
-    const active = await getJson<{ worlds: Record<string, unknown> }>(`${config.apiBase}/api/v2/shopping/active`);
+    const active = await getJson<{ worlds: Record<string, unknown> }>("/api/v2/shopping/active");
     shopWorlds = new Set(Object.keys(active.worlds ?? {}).map(Number));
   } catch {
     // Only affects ordering, never correctness.
@@ -107,18 +105,12 @@ async function main(): Promise<void> {
     return;
   }
 
-  let runId = 0;
-  try {
-    const res = await fetch(`${config.apiBase}/api/ingest/map/run`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${config.ingestToken}` },
-      body: JSON.stringify({ action: "start", mode }),
-      signal: AbortSignal.timeout(20_000),
-    });
-    if (res.ok) runId = ((await res.json()) as { id?: number }).id ?? 0;
-  } catch {
-    // Auditing is best-effort: never block a capture because the bookkeeping call failed.
-  }
+  // Auditing is best-effort: never block a capture because the bookkeeping call failed, and
+  // never RETRY the start either. It is the one ingest that is not idempotent (it INSERTs a
+  // row and hands back its id), so a retry after a timeout can leave a second run row that
+  // nobody will ever close. A missing audit row is a smaller lie than a duplicate one.
+  const startRes = await postIngest("/api/ingest/map/run", { action: "start", mode }, { attempts: 1 });
+  const runId = jsonObject<{ id?: number }>(startRes)?.id ?? 0;
 
   const started = Date.now();
   const stats = await captureMaps(opts);
@@ -132,15 +124,12 @@ async function main(): Promise<void> {
 
   if (runId) {
     const note = stats.capped ? "storage cap reached" : stats.truncated ? "time budget reached" : "ok";
-    await fetch(`${config.apiBase}/api/ingest/map/run`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${config.ingestToken}` },
-      body: JSON.stringify({
-        action: "finish", id: runId, worlds: stats.worldsDone, bytes: stats.bytesWritten,
-        errors: stats.errors, note,
-      }),
-      signal: AbortSignal.timeout(20_000),
-    }).catch(() => {});
+    // The finish DOES retry: it updates the row by id, so repeating it is a no-op, and a run
+    // left open in the dashboard reads as a crashed capture when nothing crashed.
+    await postIngest("/api/ingest/map/run", {
+      action: "finish", id: runId, worlds: stats.worldsDone, bytes: stats.bytesWritten,
+      errors: stats.errors, note,
+    });
   }
 
   // Sovereign and exo worlds expire. Their maps would otherwise sit in the bucket forever,
@@ -154,26 +143,25 @@ async function main(): Promise<void> {
   // list, and this is skipped outright when the run was filtered to a few worlds, because that
   // list is not the universe.
   if (!worldFilter?.length) {
-    try {
-      const res = await fetch(`${config.apiBase}/api/ingest/map/prune`, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${config.ingestToken}` },
-        body: JSON.stringify({ live: worldRows.map((w) => w.id) }),
-        signal: AbortSignal.timeout(60_000),
-      });
-      const out = (await res.json()) as { pruned?: number[]; failed?: number[]; skipped?: string; detail?: string };
-      // A refusal is a 503 with a `detail`, and fetch does not throw on it. Without this check
-      // the run printed nothing and exited 0, so "the server refused to prune because it could
-      // not read the world history" looked exactly like "there was nothing to release".
-      if (!res.ok) console.warn(`prune refused (${res.status}): ${out.detail ?? "no detail"}`);
-      else if (out.skipped) console.log(`prune skipped: ${out.skipped}`);
-      else if (out.pruned?.length) console.log(`released ${out.pruned.length} maps of worlds that are closed for good`);
-      // A partial failure leaves the index row in place so the next sweep retries, but it is
-      // still worth saying out loud: a world failing every time is a fault, not a hiccup.
-      if (out.failed?.length) console.warn(`prune could not release ${out.failed.length}: ${out.failed.join(", ")}`);
-    } catch (err) {
-      console.warn(`prune failed (harmless, retried next run): ${(err as Error).message}`);
-    }
+    const res = await postIngest(
+      "/api/ingest/map/prune",
+      { live: worldRows.map((w) => w.id) },
+      { timeoutMs: 60_000 },
+    );
+    const out = jsonObject<{ pruned?: number[]; failed?: number[]; skipped?: string; detail?: string }>(res);
+    // A refusal is a 503 with a `detail`, and it is not an exception. Without this check the
+    // run printed nothing and exited 0, so "the server refused to prune because it could not
+    // read the world history" looked exactly like "there was nothing to release". A 503 is
+    // retried now, so a refusal that survives is a standing one.
+    if (!res.ok) console.warn(`prune refused (${describeFailure(res)})`);
+    // The unreadable-200 gets its own line for the same reason as the refusal above: every
+    // outcome of this call has to say something, or silence means two different things.
+    else if (!out) console.warn(`prune answered HTTP ${res.status} with a body that is not JSON`);
+    else if (out.skipped) console.log(`prune skipped: ${out.skipped}`);
+    else if (out.pruned?.length) console.log(`released ${out.pruned.length} maps of worlds that are closed for good`);
+    // A partial failure leaves the index row in place so the next sweep retries, but it is
+    // still worth saying out loud: a world failing every time is a fault, not a hiccup.
+    if (out?.failed?.length) console.warn(`prune could not release ${out.failed.length}: ${out.failed.join(", ")}`);
   }
 
   // Hitting the cap is a condition the owner should see in the job status rather than

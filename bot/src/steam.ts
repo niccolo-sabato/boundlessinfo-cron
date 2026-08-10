@@ -123,15 +123,17 @@ export function getSteamTicket(opts: SteamTicketOptions = {}): Promise<string> {
       else resolve(ticket as string);
     };
 
-    if (debug) client.on("debug", (m: string) => console.log("[steam-debug]", m));
+    // Untyped parameters on purpose: steam-user declares its listeners as (...args: unknown[]),
+    // so annotating them as string does not type-check.
+    if (debug) client.on("debug", (m) => console.log("[steam-debug]", m));
 
     // Prefer a saved refresh token for headless re-logins (no 2FA). Bootstrap is
     // interactive, so it always does a fresh credential login to (re)issue one.
     const savedRefresh = readSavedRefreshToken(config.steamUsername);
     const useRefresh = !!savedRefresh && !interactive;
 
-    client.on("refreshToken", (rt: string) => {
-      if (rt) {
+    client.on("refreshToken", (rt) => {
+      if (typeof rt === "string" && rt) {
         saveRefreshToken(config.steamUsername, rt);
         console.log("[steam] Saved a refresh token; future logins are headless (no 2FA needed).");
       }

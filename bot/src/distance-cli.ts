@@ -7,6 +7,7 @@
 import { config } from "./config.ts";
 import { getQueryToken } from "./auth.ts";
 import { getWorldDistance, ingestDistances, type WorldDistanceInfo } from "./distances.ts";
+import { describeFailure, getJson } from "./http.ts";
 
 type DW = { id?: number; region?: string; lifetime?: unknown; sovereign?: boolean };
 type ApiWorld = { id: number; region?: string; is_perm?: boolean; is_sovereign?: boolean; is_exo?: boolean; distance?: number | null };
@@ -21,8 +22,7 @@ async function main() {
   // and each world's current `distance` so we can skip ones already resolved.
   let api: ApiWorld[] = [];
   try {
-    const ar = await fetch(`${config.apiBase}/api/v2/worlds?limit=500`);
-    if (ar.ok) api = ((await ar.json()) as { results?: ApiWorld[] }).results ?? [];
+    api = (await getJson<{ results?: ApiWorld[] }>("/api/v2/worlds?limit=500")).results ?? [];
   } catch {
     /* API unreachable: fall back to discovery below */
   }
@@ -45,7 +45,8 @@ async function main() {
     }
   } else {
     // Fallback: our API was unreachable, use the public discovery (perms + public sovs).
-    const res = await fetch(`${config.dsBase}/list-gameservers`);
+    // Someone else's host, so not through the shared client; the timeout is what it lacked.
+    const res = await fetch(`${config.dsBase}/list-gameservers`, { signal: AbortSignal.timeout(30_000) });
     if (!res.ok) throw new Error(`discovery HTTP ${res.status}`);
     const valid = ((await res.json()) as DW[]).filter((w) => typeof w.id === "number");
     perms = valid.filter((w) => !Array.isArray(w.lifetime) && w.sovereign !== true);
@@ -82,9 +83,17 @@ async function main() {
     }
   }
 
-  const ok = await ingestDistances(out);
-  console.log(`[distance] ingested ${Object.keys(out).length} -> ${ok ? "OK" : "FAILED"}`);
-  if (!ok) process.exit(1);
+  const res = await ingestDistances(out);
+  if (res.ok) {
+    const retried = res.attempts > 1 ? ` (${res.attempts} attempts)` : "";
+    console.log(`[distance] ingested ${Object.keys(out).length} -> OK${retried}`);
+  } else {
+    console.error(
+      `[distance] ingest of ${Object.keys(out).length} world(s) FAILED after ` +
+        `${res.attempts} attempt(s): ${describeFailure(res)}`,
+    );
+    process.exit(1);
+  }
 }
 
 main().catch((e) => {

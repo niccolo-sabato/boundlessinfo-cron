@@ -66,6 +66,7 @@
  */
 
 import { config } from "./config.ts";
+import { postIngest, jsonObject, describeFailure } from "./http.ts";
 
 export type ShopType = "S" | "B";
 
@@ -269,20 +270,32 @@ async function fetchListings(
   }
 }
 
-/** POST one chunk of a world's scan to the ingest endpoint. Returns rows written. */
+/**
+ * POST one chunk of a world's scan to the ingest endpoint. Returns rows written.
+ *
+ * TWO attempts, not the usual three, and that is the interesting decision. Unlike every other
+ * job in this bot, a failed flush here loses nothing: the buffer keeps its units, sets a
+ * 60-second retryAfter and the next flush sends them, with one last unconditional try at the
+ * end of the run. So this call already had an application-level retry, and the transport
+ * retry only needs to cover the single blip. Piling three 30-second attempts on top would
+ * quadruple the cost of a genuinely downed ingest, in the one job that is racing a wall-clock
+ * budget, to protect data that is not at risk.
+ */
 async function postChunk(worldId: number, scanned: string[], listings: ShopListing[]): Promise<number> {
   if (scanned.length === 0) return 0;
-  const res = await fetch(`${config.apiBase}/api/ingest/shopping`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${config.ingestToken}`,
-    },
-    body: JSON.stringify({ worldId, scanned, listings }),
-    signal: AbortSignal.timeout(30_000),
-  });
-  if (!res.ok) throw new Error(`ingest HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  const data = (await res.json()) as { inserted?: number; updated?: number; deleted?: number };
+  const res = await postIngest(
+    "/api/ingest/shopping",
+    { worldId, scanned, listings },
+    { attempts: 2, timeoutMs: 30_000, backoffMs: [1_000] },
+  );
+  if (!res.ok) throw new Error(`ingest ${describeFailure(res)}`);
+  // An unreadable 200 is a FAILURE here, not zero rows, and the difference is the buffer. The
+  // caller splices the sent prefix away on success and keeps it on a throw, so returning 0
+  // would discard units that may never have been written, while throwing keeps them buffered
+  // for the next flush. That is what the old `await res.json()` did by rejecting, and it is
+  // the one place in this file where being tolerant would quietly lose data.
+  const data = jsonObject<{ inserted?: number; updated?: number; deleted?: number }>(res);
+  if (!data) throw new Error(`ingest answered HTTP ${res.status} with a body that is not JSON`);
   return (data.inserted ?? 0) + (data.updated ?? 0) + (data.deleted ?? 0);
 }
 

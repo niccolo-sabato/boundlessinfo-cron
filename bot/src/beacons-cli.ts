@@ -22,6 +22,7 @@
 
 import { config } from "./config.ts";
 import { encodePlotRuns, BeaconKeyError, buildSettlements, fetchBeacons } from "./beacons.ts";
+import { postIngest, getJson, jsonObject, retryableStatus, describeFailure } from "./http.ts";
 
 function arg(name: string): string | undefined {
   const hit = process.argv.slice(2).find((a) => a.startsWith(`--${name}=`));
@@ -30,12 +31,6 @@ function arg(name: string): string | undefined {
 const hasFlag = (name: string) => process.argv.slice(2).includes(`--${name}`);
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-async function getJson<T>(url: string): Promise<T> {
-  const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
-  if (!res.ok) throw new Error(`GET ${url} -> HTTP ${res.status}`);
-  return (await res.json()) as T;
-}
 
 interface WorldRow {
   id: number;
@@ -61,35 +56,35 @@ interface IngestResult {
 /**
  * POST one world's sweep, retrying transient failures.
  *
- * Worth the few lines: a capture that already spent its time talking to the game server should
- * not be thrown away by a blip on our own side. Seen for real, a `404` arrived seconds after a
- * Worker deploy because the request reached an edge node still running the previous version,
- * which had no such route yet. Retrying rather than losing the world is obviously right.
+ * Worth it: a capture that already spent its time talking to the game server should not be
+ * thrown away by a blip on our own side. Seen for real, a 404 arrived seconds after a Worker
+ * deploy because the request reached an edge node still running the previous version, which
+ * had no such route yet. Retrying rather than losing the world is obviously right.
+ *
+ * This job had its own retry loop months before the others did; the loop now lives in
+ * http.ts and every job shares it. The one thing kept here is the shape of the answer: this
+ * caller wants the parsed rows, and a failure is fatal FOR THIS WORLD, not for the run.
+ *
+ * A 404 is not in the shared retryable set (it is normally a wrong path, not a hiccup), so it
+ * is added back here: the deploy race above is real and specific to this endpoint.
  */
-async function postIngest(payload: string): Promise<IngestResult> {
-  let last = "";
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (attempt) await sleep(2000 * attempt);
-    try {
-      const res = await fetch(`${config.apiBase}/api/ingest/beacons`, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${config.ingestToken}` },
-        body: payload,
-        signal: AbortSignal.timeout(60_000),
-      });
-      if (res.ok) {
-        const data = (await res.json()) as Partial<IngestResult>;
-        return { rows: data.rows ?? 0, plots: data.plots ?? "skipped", plotsError: data.plotsError };
-      }
-      // 401 means the token is wrong; retrying just repeats the mistake.
-      if (res.status === 401) throw new Error("ingest rejected the token (401)");
-      last = `HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`;
-    } catch (err) {
-      if ((err as Error).message.includes("401")) throw err;
-      last = (err as Error).message;
-    }
+async function postBeacons(payload: unknown): Promise<IngestResult> {
+  const res = await postIngest("/api/ingest/beacons", payload, {
+    timeoutMs: 60_000,
+    backoffMs: [2_000, 4_000],
+    retryStatus: (s) => s === 404 || retryableStatus(s),
+  });
+  if (res.ok) {
+    const data = jsonObject<Partial<IngestResult>>(res);
+    // A 200 we cannot parse is not "zero rows written": it is a world whose result we do not
+    // know, and reporting it as zero would quietly understate the sweep.
+    if (!data) throw new Error(`ingest answered HTTP ${res.status} with a body that is not JSON`);
+    return { rows: data.rows ?? 0, plots: data.plots ?? "skipped", plotsError: data.plotsError };
   }
-  throw new Error(`ingest failed after 3 attempts: ${last}`);
+  // 401 means the token is wrong. The shared helper never retries it; say so plainly, because
+  // it is the one failure here that no amount of waiting fixes.
+  if (res.status === 401) throw new Error("ingest rejected the token (401)");
+  throw new Error(`ingest failed after ${res.attempts} attempt(s): ${describeFailure(res)}`);
 }
 
 async function main(): Promise<void> {
@@ -97,23 +92,17 @@ async function main(): Promise<void> {
   const dryRun = hasFlag("dry-run");
   const deadline = Date.now() + config.beaconTimeBudgetMs;
 
-  const all = (await getJson<{ results: WorldRow[] }>(`${config.apiBase}/api/v2/worlds?limit=500`)).results;
+  const all = (await getJson<{ results: WorldRow[] }>("/api/v2/worlds?limit=500")).results;
   const worlds = all.filter((w) => w.api_url && (!filter?.length || filter.includes(w.id)));
   console.log(`beacons: ${worlds.length} worlds, budget ${Math.round(config.beaconTimeBudgetMs / 60000)} min`);
 
+  // Auditing is best-effort: never block a capture on the bookkeeping call, and never retry
+  // the start, which INSERTs a row and returns its id. A duplicate open run row would sit in
+  // the dashboard forever; a missing one costs nothing but the record of this sweep.
   let runId = 0;
   if (!dryRun) {
-    try {
-      const res = await fetch(`${config.apiBase}/api/ingest/beacons/run`, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${config.ingestToken}` },
-        body: JSON.stringify({ action: "start" }),
-        signal: AbortSignal.timeout(20_000),
-      });
-      if (res.ok) runId = ((await res.json()) as { id?: number }).id ?? 0;
-    } catch {
-      // Auditing is best-effort: never block a capture on the bookkeeping call.
-    }
+    const startRes = await postIngest("/api/ingest/beacons/run", { action: "start" }, { attempts: 1 });
+    runId = jsonObject<{ id?: number }>(startRes)?.id ?? 0;
   }
 
   const started = Date.now();
@@ -177,7 +166,7 @@ async function main(): Promise<void> {
       }
 
       if (!dryRun) {
-        const payload = JSON.stringify({
+        const payload = {
           worldId: w.id,
           worldSizePlots: pack.worldSizePlots,
           // The plot-ownership map, run-length encoded. It used to be dropped here as "a
@@ -194,8 +183,8 @@ async function main(): Promise<void> {
             name: s.name, mayor: s.mayor, prestige: s.prestige, beacons: s.beacons,
             plots: s.plots, x: s.x, y: s.y, z: s.z,
           })),
-        });
-        const result = await postIngest(payload);
+        };
+        const result = await postBeacons(payload);
         rows += result.rows;
         if (result.plots === "stored") plotsStored++;
         else if (result.plots === "invalid") {
@@ -232,18 +221,14 @@ async function main(): Promise<void> {
   if (!dryRun) console.log(`  ${plotNote}`);
 
   if (runId) {
-    await fetch(`${config.apiBase}/api/ingest/beacons/run`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${config.ingestToken}` },
-      body: JSON.stringify({
-        action: "finish", id: runId, worlds: done, beacons: totalBeacons, rows, errors,
-        // Folded into the note because `beacon_runs` has no column for it. A rejected or
-        // un-sent grid is now visible in the admin dashboard's run list instead of only in a
-        // job log that expires.
-        note: (truncated ? "time budget reached" : "ok") + `; ${plotNote}`,
-      }),
-      signal: AbortSignal.timeout(20_000),
-    }).catch(() => {});
+    // Retried, unlike the start: this updates the row by id, so repeating is a no-op.
+    await postIngest("/api/ingest/beacons/run", {
+      action: "finish", id: runId, worlds: done, beacons: totalBeacons, rows, errors,
+      // Folded into the note because `beacon_runs` has no column for it. A rejected or
+      // un-sent grid is now visible in the admin dashboard's run list instead of only in a
+      // job log that expires.
+      note: (truncated ? "time budget reached" : "ok") + `; ${plotNote}`,
+    });
   }
 }
 

@@ -170,7 +170,7 @@ export function encodePng(img: Raster): Buffer {
     Buffer.allocUnsafe(stride),
   ];
   const zero = Buffer.alloc(stride);
-  let prev = zero;
+  let prev: Uint8Array = zero;
 
   for (let y = 0; y < height; y++) {
     const line = rgb.subarray(y * stride, y * stride + stride);

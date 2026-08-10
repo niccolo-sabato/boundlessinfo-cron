@@ -12,6 +12,7 @@
  * is already change-aware (it skips the KV write when a world's colours are unchanged).
  */
 import { captureWorldColours, ingestColours } from "./capture-colors.ts";
+import { describeFailure, getJson } from "./http.ts";
 import { config } from "./config.ts";
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -26,7 +27,9 @@ async function getAllWorldIds(): Promise<number[]> {
   const ids = new Set<number>();
 
   try {
-    const r = await fetch(`${config.dsBase}/list-gameservers`);
+    // Someone else's host, so not through the shared client, but it had no timeout at all:
+    // a hang here could only end when the workflow's own clock ran out.
+    const r = await fetch(`${config.dsBase}/list-gameservers`, { signal: AbortSignal.timeout(30_000) });
     if (r.ok) {
       for (const w of (await r.json()) as { id?: number }[]) {
         if (Number.isFinite(w.id)) ids.add(w.id as number);
@@ -37,12 +40,9 @@ async function getAllWorldIds(): Promise<number[]> {
   }
 
   try {
-    const r = await fetch(`${config.apiBase}/api/v2/worlds`);
-    if (r.ok) {
-      const list = ((await r.json()) as { results?: { id?: number }[] }).results ?? [];
-      if (list.length > 1) {
-        for (const w of list) if (Number.isFinite(w.id)) ids.add(w.id as number);
-      }
+    const list = (await getJson<{ results?: { id?: number }[] }>("/api/v2/worlds")).results ?? [];
+    if (list.length > 1) {
+      for (const w of list) if (Number.isFinite(w.id)) ids.add(w.id as number);
     }
   } catch {
     /* API unreachable; rely on the discovery */
@@ -54,11 +54,9 @@ async function getAllWorldIds(): Promise<number[]> {
 /** Only the Sovereign worlds (the only ones whose colours can change after spawn). */
 async function getSovereignIds(): Promise<number[]> {
   try {
-    const r = await fetch(`${config.apiBase}/api/v2/worlds?is_sovereign=true&limit=500`);
-    if (r.ok) {
-      const list = ((await r.json()) as { results?: { id?: number }[] }).results ?? [];
-      return list.map((w) => w.id).filter((n): n is number => Number.isFinite(n) && (n as number) > 0);
-    }
+    const list =
+      (await getJson<{ results?: { id?: number }[] }>("/api/v2/worlds?is_sovereign=true&limit=500")).results ?? [];
+    return list.map((w) => w.id).filter((n): n is number => Number.isFinite(n) && (n as number) > 0);
   } catch {
     /* API unreachable */
   }
@@ -73,14 +71,12 @@ async function getSovereignIds(): Promise<number[]> {
  */
 async function getNonPermIds(): Promise<number[]> {
   try {
-    const r = await fetch(`${config.apiBase}/api/v2/worlds?limit=500`);
-    if (r.ok) {
-      const list = ((await r.json()) as { results?: { id?: number; is_perm?: boolean }[] }).results ?? [];
-      return list
-        .filter((w) => !w.is_perm)
-        .map((w) => w.id)
-        .filter((n): n is number => Number.isFinite(n) && (n as number) > 0);
-    }
+    const list =
+      (await getJson<{ results?: { id?: number; is_perm?: boolean }[] }>("/api/v2/worlds?limit=500")).results ?? [];
+    return list
+      .filter((w) => !w.is_perm)
+      .map((w) => w.id)
+      .filter((n): n is number => Number.isFinite(n) && (n as number) > 0);
   } catch {
     /* API unreachable */
   }
@@ -109,15 +105,30 @@ async function main(): Promise<void> {
 
   let ok = 0;
   let fail = 0;
+  // Counted apart from `fail` on purpose. A world that answers no world-config is ordinary (it
+  // may be starting, or locked) and must not colour the job red. An ingest that failed three
+  // attempts is our own side losing a capture we already paid for, and that is worth the job
+  // going red: the colours are not lost for good, because the 6-hourly sweep re-captures every
+  // sovereign and exo with --non-perm, but that sweep runs under continue-on-error and never
+  // alerts, so this is the only place a standing ingest failure is ever visible.
+  let ingestFailures = 0;
   for (const id of ids) {
     try {
       const r = await captureWorldColours(id);
-      if (r && (await ingestColours(r))) {
-        ok++;
-        console.log(`[capture] world ${id}: ${Object.keys(r.blockColors).length} colours -> OK`);
-      } else {
+      if (!r) {
         fail++;
-        console.log(`[capture] world ${id}: ${r ? "ingest FAILED" : "no world-config"}`);
+        console.log(`[capture] world ${id}: no world-config`);
+      } else {
+        const res = await ingestColours(r);
+        if (res.ok) {
+          ok++;
+          const retried = res.attempts > 1 ? ` (${res.attempts} attempts)` : "";
+          console.log(`[capture] world ${id}: ${Object.keys(r.blockColors).length} colours -> OK${retried}`);
+        } else {
+          fail++;
+          ingestFailures++;
+          console.log(`[capture] world ${id}: ingest FAILED - ${describeFailure(res)}`);
+        }
       }
     } catch (e) {
       fail++;
@@ -125,7 +136,11 @@ async function main(): Promise<void> {
     }
     await sleep(1200); // be a good citizen between worlds
   }
-  console.log(`[capture] done: ${ok} ok, ${fail} failed`);
+  console.log(`[capture] done: ${ok} ok, ${fail} failed` + (ingestFailures ? `, of which ${ingestFailures} ingest failure(s)` : ""));
+  if (ingestFailures) {
+    console.error(`[capture] ${ingestFailures} capture(s) could not be written to the API; failing the job so it is seen`);
+    process.exitCode = 1;
+  }
 }
 
 main().catch((e) => {

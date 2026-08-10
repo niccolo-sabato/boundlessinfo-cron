@@ -21,9 +21,16 @@
     "diag-image": "node --experimental-strip-types src/diag-image.ts",
     "diag-map-origin": "node --experimental-strip-types src/diag-map-origin.ts",
     "beacons": "node --experimental-strip-types src/beacons-cli.ts",
-    "diag-beacons": "node --experimental-strip-types src/diag-beacons.ts"
+    "diag-beacons": "node --experimental-strip-types src/diag-beacons.ts",
+    "test": "node --experimental-strip-types --test test/http.test.ts",
+    "typecheck": "tsc --noEmit"
   },
+  "//devDependencies": "Dev-time only, and PINNED rather than caret-ranged on purpose: an unpinned compiler makes the check mean different things on different machines. It was found the hard way, tsc 5.7 called this tree clean while 5.9.3 reported a real error in an untouched file. The scheduled jobs install with --omit=dev, so the compiler never ships to a runner: the bot itself runs under node --experimental-strip-types and never needs TypeScript at run time.",
   "dependencies": {
     "steam-user": "^5.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "25.9.3",
+    "typescript": "5.9.3"
   }
 }

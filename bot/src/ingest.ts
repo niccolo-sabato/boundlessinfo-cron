@@ -12,48 +12,25 @@
  */
 
 import type { DiscoveredWorld } from "./discover.ts";
-import { config } from "./config.ts";
+import { postIngest, type PostResult } from "./http.ts";
 
-export interface IngestResult {
-  ok: boolean;
-  status: number;
-  body: unknown;
-}
+export type IngestResult = PostResult;
 
 /**
- * Send the discovered worlds to the ingest endpoint. Returns the parsed result;
- * throws only on a network/transport failure (HTTP errors are returned so the
- * caller can log + decide). Posts nothing (and returns ok) for an empty list.
+ * Send the discovered worlds to the ingest endpoint.
+ *
+ * Never throws: transport failures come back as `ok: false` with an `error`, so the caller
+ * decides whether to fail the job. Retries are handled in `postIngest` and are safe here
+ * because the endpoint merges worlds field-wise by id. Posts nothing (and returns ok) for an
+ * empty list.
+ *
+ * This used to be a bare fetch on the eight-second per-probe timeout with no retry, which is
+ * what turned a single hung connection on 2026-08-10 into a failed poll and an alert. See the
+ * header of http.ts for the measurement.
  */
 export async function ingestWorlds(worlds: DiscoveredWorld[]): Promise<IngestResult> {
   if (worlds.length === 0) {
-    return { ok: true, status: 0, body: { skipped: "no worlds to ingest" } };
+    return { ok: true, status: 0, body: { skipped: "no worlds to ingest" }, attempts: 0 };
   }
-
-  const url = `${config.apiBase}/api/ingest/worlds`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), config.requestTimeoutMs);
-
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${config.ingestToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ worlds }),
-      signal: controller.signal,
-    });
-
-    let body: unknown;
-    try {
-      body = await res.json();
-    } catch {
-      body = await res.text().catch(() => "");
-    }
-
-    return { ok: res.ok, status: res.status, body };
-  } finally {
-    clearTimeout(timer);
-  }
+  return postIngest("/api/ingest/worlds", { worlds });
 }

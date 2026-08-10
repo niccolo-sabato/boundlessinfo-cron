@@ -11,6 +11,7 @@
 import { getQueryToken, type QueryToken } from "./auth.ts";
 import { buildPlainBody, authenticatedPost } from "./protocol.ts";
 import { config } from "./config.ts";
+import { postIngest, type PostResult } from "./http.ts";
 
 export { getQueryToken };
 
@@ -34,12 +35,15 @@ export async function getWorldDistance(
   return typeof data.distance === "number" ? data.distance : null;
 }
 
-/** POST a { worldId: {assignment, distance} } map to the Worker ingest (Bearer). */
-export async function ingestDistances(distances: Record<string, WorldDistanceInfo>): Promise<boolean> {
-  const res = await fetch(`${config.apiBase}/api/ingest-distances`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${config.ingestToken}`, "content-type": "application/json" },
-    body: JSON.stringify({ distances }),
-  });
-  return res.ok;
+/**
+ * POST a { worldId: {assignment, distance} } map to the Worker ingest.
+ *
+ * Like the colour ingest, this had no timeout and no retry, so a hung connection ended the job
+ * only when the workflow's clock ran out and threw away a sweep that costs one DS request per
+ * (target, perm) pair. Repeating is safe: the endpoint replaces by world id.
+ */
+export async function ingestDistances(
+  distances: Record<string, WorldDistanceInfo>,
+): Promise<PostResult> {
+  return postIngest("/api/ingest-distances", { distances });
 }

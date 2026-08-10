@@ -14,6 +14,10 @@ permissions:
 jobs:
   keepalive:
     runs-on: ubuntu-latest
+    # The only job here without one. Nothing in it should take a minute, so a run that is still
+    # going after five is stuck on a push that will not complete, and holding a runner for the
+    # six-hour default helps nobody.
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - name: Empty keepalive commit

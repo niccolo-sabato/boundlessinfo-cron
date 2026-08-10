@@ -22,6 +22,7 @@
 import { getQueryToken } from "./auth.ts";
 import { buildPlainBody, authenticatedPost } from "./protocol.ts";
 import { config } from "./config.ts";
+import { postIngest, type PostResult } from "./http.ts";
 
 // Captured constants (update commitId/version on a game update if auth starts failing).
 const GAME_VERSION = { buildStamp: "", commitId: "c6936248", major: 1, minor: 18, point: 94 };
@@ -160,15 +161,17 @@ export async function captureWorldColours(
   });
 }
 
-/** POST captured colours to our Worker ingest (Bearer auth). */
-export async function ingestColours(r: CaptureResult): Promise<boolean> {
-  const res = await fetch(`${config.apiBase}/api/ingest-ws-data`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${config.ingestToken}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ world_id: r.worldId, config: { world: { blockColors: r.blockColors } } }),
+/**
+ * POST captured colours to our Worker ingest.
+ *
+ * Retried and, more to the point, given a timeout at all: this call had neither, so a hung
+ * connection here could only end when the workflow's own clock ran out, and a single blip
+ * discarded a websocket capture that had just been paid for. Safe to repeat because the
+ * endpoint upserts on (world, block, colour).
+ */
+export async function ingestColours(r: CaptureResult): Promise<PostResult> {
+  return postIngest("/api/ingest-ws-data", {
+    world_id: r.worldId,
+    config: { world: { blockColors: r.blockColors } },
   });
-  return res.ok;
 }

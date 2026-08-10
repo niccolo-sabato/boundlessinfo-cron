@@ -12,6 +12,7 @@
 import { config } from "./config.ts";
 import { scanWorlds, scanWorldIds, type DiscoveredWorld } from "./discover.ts";
 import { ingestWorlds } from "./ingest.ts";
+import { describeFailure } from "./http.ts";
 
 function logWorld(w: DiscoveredWorld): void {
   const kind = w.sovereign ? "sovereign" : w.lifetime ? "exo" : "perm";
@@ -49,9 +50,12 @@ async function main(): Promise<void> {
   console.log(`[run] posting ${worlds.length} world(s) to ${config.apiBase}/api/ingest/worlds`);
   const result = await ingestWorlds(worlds);
   if (result.ok) {
-    console.log(`[run] ingest ok (HTTP ${result.status}):`, JSON.stringify(result.body));
+    // Say so when it took more than one go: a run that recovered looks identical to a clean
+    // one in the job log otherwise, and a rising retry count is the early warning.
+    const retried = result.attempts > 1 ? ` after ${result.attempts} attempts` : "";
+    console.log(`[run] ingest ok (HTTP ${result.status})${retried}:`, JSON.stringify(result.body));
   } else {
-    console.error(`[run] ingest FAILED (HTTP ${result.status}):`, JSON.stringify(result.body));
+    console.error(`[run] ingest FAILED after ${result.attempts} attempt(s): ${describeFailure(result)}`);
     process.exitCode = 1;
   }
 }
