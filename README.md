@@ -33,6 +33,10 @@ interrupted sweep is always safe.
 
 - **Shopping** writes to D1, where the free tier allows 100k row-writes a day. The ingest is
   diff-based: a re-scan that finds nothing changed writes zero rows.
+- **Shopping and beacons** also depend on the day's D1 read allowance, which the whole site
+  shares. Each run asks the API first and is skipped when 97% of the day is already spent;
+  a chunk the API refuses for the same reason (507 with `budget: true`) stops the sweep.
+  Both are pauses, not failures: the job exits 0 and the first run after 00:00 UTC carries on.
 - **Maps** write to R2. The ingest refuses an upload past 200 worlds or 3 GiB and answers 507,
   which stops the run and exits non-zero so the Telegram alert fires.
 

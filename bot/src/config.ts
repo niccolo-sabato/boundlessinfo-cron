@@ -117,6 +117,10 @@ export const config = {
   get ingestToken() {
     return req("INGEST_TOKEN");
   },
+  /** The same token when this job has one, undefined otherwise: for calls that work without it. */
+  get ingestTokenIfAny(): string | undefined {
+    return process.env.INGEST_TOKEN || undefined;
+  },
 
   // --- Discovery scan window (world id range to probe) ---
   get scanMin() {

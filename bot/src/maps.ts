@@ -26,7 +26,7 @@
 
 import { config } from "./config.ts";
 import { decodePng, decodeTga, downscale, encodePng, type Raster } from "./image.ts";
-import { postIngest, postIngestBinary, describeFailure } from "./http.ts";
+import { postIngest, postIngestBinary, describeFailure, getJson } from "./http.ts";
 import { gunzipSync } from "node:zlib";
 
 export interface MapWorld {
@@ -336,11 +336,9 @@ export async function backfillThumbs(
   const out = { done: 0, skipped: 0, errors: 0, bytes: 0 };
   for (const id of worldIds) {
     try {
-      const recRes = await fetch(`${config.apiBase}/api/v2/maps/${id}`, {
-        signal: AbortSignal.timeout(30_000),
-      });
-      if (!recRes.ok) throw new Error(`record -> HTTP ${recRes.status}`);
-      const rec = (await recRes.json()) as StoredMap;
+      // Through getJson, which carries the ingest token: this is a job reading D1 through a
+      // public route, and without the token the Worker would hold it to the public ceiling.
+      const rec = await getJson<StoredMap>(`/api/v2/maps/${id}`, { attempts: 2 });
       if (rec.bytes_thumb !== null) {
         out.skipped++;
         continue;

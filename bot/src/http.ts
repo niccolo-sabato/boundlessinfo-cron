@@ -83,9 +83,10 @@ const DEFAULT_BACKOFF_MS = [1_000, 3_000];
 /**
  * Statuses worth trying again: the server said "not now" rather than "no".
  *
- * 507 is deliberately excluded even though it is a 5xx. It is the map ingest saying the storage
- * cap is reached, which is a decision, not a hiccup: posting the same image again cannot make
- * room, and the caller turns it into a MapCapError that stops the run on purpose.
+ * 507 is deliberately excluded even though it is a 5xx. The Worker uses it for two decisions,
+ * neither of them a hiccup: the map ingest saying the storage cap is reached (posting the same
+ * image again cannot make room, and the caller turns it into a MapCapError that stops the run
+ * on purpose), and any capture ingest saying the day's D1 budget is spent (see BudgetPause).
  */
 export function retryableStatus(status: number): boolean {
   if (status === 507) return false;
@@ -202,8 +203,8 @@ async function request(
  * Our own API, and nothing else, may be given the ingest token.
  *
  * The POST helpers take a root-relative path for exactly this reason: an absolute URL here
- * would be a bearer token pointed at whatever host the caller passed. The GET helper is free
- * to take one, because it sends no credentials.
+ * would be a bearer token pointed at whatever host the caller passed. The GET helper may take
+ * one too, and then sends no credentials: only a root-relative path carries the token.
  */
 function ingestUrl(path: string): string {
   if (!path.startsWith("/")) {
@@ -256,12 +257,22 @@ export async function postIngestBinary(
  * list has nothing to do, and every call site was already written around a throw.
  *
  * Takes a root-relative path OR an absolute URL: the shopping job also reads the site's static
- * data files, which live on another host. Safe here and not on the POSTs, because this sends
- * no credentials to anybody.
+ * data files, which live on another host. An absolute URL is sent no credentials at all.
+ *
+ * A root-relative path, which is always our own API, carries the ingest token when the job
+ * has one. Not to be allowed anything a public reader is not, but to be recognised as a job:
+ * the Worker holds anonymous D1 reads to a per-address rate limit and to a daily ceiling
+ * (lib/guard.ts in the API), and a capture job reading its work list (/shopping/active,
+ * /maps/coverage) must not be stopped by either. Its own, higher ceiling is applied where it
+ * writes.
  */
 export async function getJson<T>(pathOrUrl: string, opts: PostOptions = {}): Promise<T> {
-  const url = /^https?:\/\//.test(pathOrUrl) ? pathOrUrl : ingestUrl(pathOrUrl);
-  const r = await request("GET", url, undefined, { accept: "application/json" }, {
+  const own = !/^https?:\/\//.test(pathOrUrl);
+  const url = own ? ingestUrl(pathOrUrl) : pathOrUrl;
+  const token = own ? config.ingestTokenIfAny : undefined;
+  const headers: Record<string, string> = { accept: "application/json" };
+  if (token) headers.authorization = `Bearer ${token}`;
+  const r = await request("GET", url, undefined, headers, {
     timeoutMs: 30_000,
     ...opts,
   });
@@ -274,4 +285,52 @@ export async function getJson<T>(pathOrUrl: string, opts: PostOptions = {}): Pro
     throw new Error(`GET ${url} -> HTTP ${r.status} with ${shape}, not JSON`);
   }
   return r.body as T;
+}
+
+/**
+ * The API refused a capture call because the day's D1 budget is nearly spent.
+ *
+ * A pause, not a failure. The Worker answers 507 with `budget: true` once the account has read
+ * 97% of its daily D1 allowance (lib/guard.ts in the API), and nothing a job does changes that
+ * before 00:00 UTC. So the job stops cleanly, with exit code 0, and the first scheduled run
+ * after the reset carries on: retrying would only spend game-server time on writes that are
+ * going to be refused.
+ */
+export class BudgetPause extends Error {}
+
+/** The Worker's "D1 daily budget" refusal, and nothing else: the map storage cap is a 507 too. */
+export function isBudgetRefusal(r: PostResult): boolean {
+  return (
+    r.status === 507 &&
+    r.body !== null &&
+    typeof r.body === "object" &&
+    (r.body as { budget?: unknown }).budget === true
+  );
+}
+
+/**
+ * Whether today's D1 budget leaves room for a capture run, asked before the run starts.
+ *
+ * Asked first so that a day already spent, by anybody, costs the game servers nothing either:
+ * the sweep is skipped instead of scanned and then refused chunk by chunk. FAIL-OPEN: when no
+ * answer can be had (the API is down, or is a deployment older than the endpoint) the run goes
+ * ahead, and the ingest's own 507 remains the backstop.
+ */
+export async function d1BudgetAllowsCapture(job: string, opts: PostOptions = {}): Promise<boolean> {
+  const r = await postIngest("/api/ingest/budget", {}, { attempts: 2, timeoutMs: 15_000, backoffMs: [2_000], ...opts });
+  const b = jsonObject<{ known?: unknown; jobs_allowed?: unknown; share?: unknown; resets_in_s?: unknown }>(r);
+  if (!b || typeof b.jobs_allowed !== "boolean") {
+    console.warn(`[${job}] D1 budget unknown (${describeFailure(r)}); going ahead`);
+    return true;
+  }
+  // The API answered without knowing the figure: its analytics token is missing or failing, so
+  // its D1 ceilings are off. No reason to skip the run, but one to say so where the owner will
+  // see it: `::warning::` becomes an annotation on the workflow run.
+  if (b.known === false) {
+    console.warn(`::warning::[${job}] the API cannot read today's D1 usage, its budget guard is off (check CF_ANALYTICS_TOKEN)`);
+  }
+  if (b.jobs_allowed) return true;
+  const reset = typeof b.resets_in_s === "number" ? `, resets in ${(b.resets_in_s / 3600).toFixed(1)} h` : "";
+  console.log(`[${job}] D1 daily budget nearly used (${b.share}% read${reset}): skipping this run`);
+  return false;
 }

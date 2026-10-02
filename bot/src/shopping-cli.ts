@@ -18,7 +18,14 @@
 
 import { config } from "./config.ts";
 import { captureShopping, EST_UNIT_MS, ShopKeyError, type CaptureWorld } from "./shopping.ts";
-import { postIngest, getJson, jsonObject, describeFailure } from "./http.ts";
+import {
+  postIngest,
+  getJson,
+  jsonObject,
+  describeFailure,
+  d1BudgetAllowsCapture,
+  isBudgetRefusal,
+} from "./http.ts";
 
 const SITE_DATA = process.env.SITE_DATA_BASE ?? "https://boundlessinfo.pages.dev/data";
 
@@ -63,6 +70,11 @@ async function loadPriority(): Promise<number[]> {
 async function main(): Promise<void> {
   const mode = (arg("mode") ?? process.env.SHOP_MODE ?? "hot") as "hot" | "discover" | "full";
   if (!["hot", "discover", "full"].includes(mode)) throw new Error(`unknown mode ${mode}`);
+
+  // A day whose D1 budget is already spent is skipped before it costs the game servers a
+  // single request. Not a failure: the first scheduled run after 00:00 UTC carries on. The
+  // rollup is skipped with it, since the API would refuse that too.
+  if (!(await d1BudgetAllowsCapture("shopping"))) return;
 
   const worldFilter = arg("worlds")?.split(",").map(Number).filter(Number.isFinite);
   const itemFilter = arg("items")?.split(",").map(Number).filter(Number.isFinite);
@@ -114,6 +126,12 @@ async function main(): Promise<void> {
     { action: "start", mode: effectiveMode },
     { attempts: 1 },
   );
+  // The one refusal the start is NOT best-effort about: the budget ran out between the check
+  // above and here, and a sweep now would scan everything only to have every chunk refused.
+  if (isBudgetRefusal(startRes)) {
+    console.log(`D1 daily budget nearly used (${describeFailure(startRes)}): skipping this run`);
+    return;
+  }
   const runId = jsonObject<{ id?: number }>(startRes)?.id ?? 0;
 
   const started = Date.now();
@@ -180,11 +198,19 @@ async function main(): Promise<void> {
           `impossible; if this repeats, something else is using this key concurrently.`,
       );
     }
-    note = stats.truncated
-      ? "time budget reached"
-      : stats.ingestErrors
-        ? `ok (${stats.ingestErrors} ingest failures)`
-        : "ok";
+    if (stats.paused) {
+      console.log(
+        `  PAUSED: the API refused writes for the day's D1 budget. ${stats.unsent} verified units ` +
+          `were not written; the first run after 00:00 UTC verifies them again.`,
+      );
+    }
+    note = stats.paused
+      ? "paused: D1 daily budget"
+      : stats.truncated
+        ? "time budget reached"
+        : stats.ingestErrors
+          ? `ok (${stats.ingestErrors} ingest failures)`
+          : "ok";
     if (runId) {
       // Retried, unlike the start: this updates the row by id, so repeating it is a no-op,
       // and a sweep left open in the dashboard reads as a crash that never happened.
@@ -208,6 +234,8 @@ async function main(): Promise<void> {
   if (hasFlag("rollup")) {
     const res = await postIngest("/api/ingest/shopping/rollup", {}, { timeoutMs: 60_000 });
     if (res.ok) console.log(`rollup: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 120)}`);
+    // Refused for the day's D1 budget: a pause like the sweep's, not a failure to alert on.
+    else if (isBudgetRefusal(res)) console.log(`rollup skipped: D1 daily budget (${describeFailure(res)})`);
     // The rollup is what feeds the item pages' price summaries. It used to print its status
     // and move on whatever it was, so a failing rollup was one grey line in a green job.
     else {

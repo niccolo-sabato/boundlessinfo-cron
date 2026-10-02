@@ -24,8 +24,16 @@ import assert from "node:assert/strict";
 process.env.API_BASE = "https://api.test.invalid";
 process.env.INGEST_TOKEN = "test-token";
 
-const { postIngest, postIngestBinary, getJson, jsonObject, retryableStatus, describeFailure } =
-  await import("../src/http.ts");
+const {
+  postIngest,
+  postIngestBinary,
+  getJson,
+  jsonObject,
+  retryableStatus,
+  describeFailure,
+  isBudgetRefusal,
+  d1BudgetAllowsCapture,
+} = await import("../src/http.ts");
 
 /** One recorded call to the fake fetch. */
 interface Call {
@@ -327,7 +335,7 @@ test("getJson resolves a root-relative path against the configured base and retr
 
 test("getJson may be given an absolute URL, and sends no credentials to it", async () => {
   // The shopping job reads the site's static catalogue, which is a different host. That is
-  // only safe because a GET carries no token: the POST helpers refuse absolute URLs entirely.
+  // only safe because an absolute URL gets no token: the POST helpers refuse them entirely.
   const f = fakeFetch([json([{ game_id: 9 }])]);
   const out = await getJson<{ game_id: number }[]>("https://elsewhere.test/data/items.json", {
     fetchImpl: f.impl, sleepImpl: fakeSleep().impl,
@@ -336,7 +344,71 @@ test("getJson may be given an absolute URL, and sends no credentials to it", asy
   assert.deepEqual(out, [{ game_id: 9 }]);
   assert.equal(f.calls[0].url, "https://elsewhere.test/data/items.json");
   const headers = f.calls[0].init.headers as Record<string, string>;
-  assert.equal(headers.authorization, undefined, "a GET must never carry the ingest token");
+  assert.equal(headers.authorization, undefined, "an absolute URL must never carry the ingest token");
+});
+
+test("getJson tells our own API it is a job: a root-relative path carries the token", async () => {
+  // The Worker holds anonymous D1 reads to a public ceiling; a job reading its work list from
+  // /shopping/active or /maps/coverage must not be stopped by it.
+  const f = fakeFetch([json({ worlds: {} })]);
+  await getJson("/api/v2/maps/coverage", { fetchImpl: f.impl, sleepImpl: fakeSleep().impl });
+  const headers = f.calls[0].init.headers as Record<string, string>;
+  assert.equal(headers.authorization, "Bearer test-token");
+});
+
+test("getJson without a token still reads, as public traffic, instead of throwing", async () => {
+  const saved = process.env.INGEST_TOKEN;
+  delete process.env.INGEST_TOKEN;
+  try {
+    const f = fakeFetch([json({ results: [] })]);
+    await getJson("/api/v2/worlds", { fetchImpl: f.impl, sleepImpl: fakeSleep().impl });
+    const headers = f.calls[0].init.headers as Record<string, string>;
+    assert.equal(headers.authorization, undefined);
+  } finally {
+    process.env.INGEST_TOKEN = saved;
+  }
+});
+
+test("isBudgetRefusal: the D1 budget's 507, and not the map storage cap's", async () => {
+  const sent = (r: Response) => postIngest("/api/ingest/shopping", {}, { fetchImpl: fakeFetch([r]).impl, attempts: 1 });
+  assert.equal(isBudgetRefusal(await sent(json({ detail: "budget", budget: true }, 507))), true);
+  assert.equal(isBudgetRefusal(await sent(json({ detail: "storage limit reached" }, 507))), false);
+  assert.equal(
+    isBudgetRefusal(await sent(json({ detail: "resting", budget: true }, 503))),
+    false,
+    "a public refusal is not the jobs' pause",
+  );
+  assert.equal(isBudgetRefusal(await sent(new Response("<html>507</html>", { status: 507 }))), false);
+});
+
+test("d1BudgetAllowsCapture: skips only on an explicit no, and goes ahead when it cannot tell", async (t) => {
+  t.mock.method(console, "log", () => {});
+  t.mock.method(console, "warn", () => {});
+  const ask = (...script: Array<Response | Error>) =>
+    d1BudgetAllowsCapture("test", { fetchImpl: fakeFetch(script).impl, sleepImpl: fakeSleep().impl, onRetry: () => {} });
+
+  assert.equal(await ask(json({ jobs_allowed: false, share: 97.4, resets_in_s: 7200 })), false);
+  assert.equal(await ask(json({ jobs_allowed: true, share: 21 })), true);
+  assert.equal(await ask(json({ detail: "Not found" }, 404)), true, "an API older than the endpoint");
+  assert.equal(await ask(new Error("ECONNRESET")), true);
+  assert.equal(await ask(json({ known: false })), true, "an answer without the field");
+});
+
+test("d1BudgetAllowsCapture: a guard that cannot read the figure is reported, and the run goes ahead", async (t) => {
+  const warned: string[] = [];
+  t.mock.method(console, "warn", (m: string) => void warned.push(m));
+  // The shape the Worker really sends when its analytics token is missing or failing.
+  const f = fakeFetch([json({ known: false, jobs_allowed: true, share: null })]);
+  assert.equal(await d1BudgetAllowsCapture("test", { fetchImpl: f.impl }), true);
+  assert.ok(warned.some((m) => m.startsWith("::warning::") && m.includes("CF_ANALYTICS_TOKEN")), warned.join("\n"));
+});
+
+test("d1BudgetAllowsCapture asks our own API, with the token", async () => {
+  const f = fakeFetch([json({ jobs_allowed: true })]);
+  await d1BudgetAllowsCapture("test", { fetchImpl: f.impl });
+  assert.equal(f.calls[0].url, "https://api.test.invalid/api/ingest/budget");
+  assert.equal(f.calls[0].init.method, "POST");
+  assert.equal((f.calls[0].init.headers as Record<string, string>).authorization, "Bearer test-token");
 });
 
 test("getJson throws when it finally gives up, with the status in the message", async () => {

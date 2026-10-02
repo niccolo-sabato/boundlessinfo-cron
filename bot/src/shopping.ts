@@ -66,7 +66,7 @@
  */
 
 import { config } from "./config.ts";
-import { postIngest, jsonObject, describeFailure } from "./http.ts";
+import { postIngest, jsonObject, describeFailure, BudgetPause, isBudgetRefusal } from "./http.ts";
 
 export type ShopType = "S" | "B";
 
@@ -115,6 +115,10 @@ export interface CaptureStats {
   worldsSkipped: number;
   rowsWritten: number;
   truncated: boolean;
+  /** Stopped early because the API refused writes for the day's D1 budget (see BudgetPause). */
+  paused: boolean;
+  /** Units verified but never written because of that pause; the next run re-verifies them. */
+  unsent: number;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -288,6 +292,9 @@ async function postChunk(worldId: number, scanned: string[], listings: ShopListi
     { worldId, scanned, listings },
     { attempts: 2, timeoutMs: 30_000, backoffMs: [1_000] },
   );
+  // Not an ingest failure to retry in a minute: the day's D1 budget is spent, and every later
+  // chunk would be refused the same way until 00:00 UTC. The sweep stops instead.
+  if (isBudgetRefusal(res)) throw new BudgetPause(`ingest ${describeFailure(res)}`);
   if (!res.ok) throw new Error(`ingest ${describeFailure(res)}`);
   // An unreadable 200 is a FAILURE here, not zero rows, and the difference is the buffer. The
   // caller splices the sent prefix away on success and keeps it on a throw, so returning 0
@@ -448,7 +455,7 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
   const stats: CaptureStats = {
     requests: 0, ok: 0, shed: 0, busy: 0, overrate: 0, netErrors: 0,
     listings: 0, itemsDone: 0, errors: 0, ingestErrors: 0, worldsDone: 0, worldsSkipped: 0,
-    rowsWritten: 0, truncated: false,
+    rowsWritten: 0, truncated: false, paused: false, unsent: 0,
   };
 
   const all = opts.worlds
@@ -555,6 +562,12 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
   // more than one request in flight against it, which is the rule the docs actually state;
   // the parallelism is across game servers, where nothing forbids it.
   const buffers = queue.map<WorldBuffer>((t) => ({ world: t.world, scanned: [], listings: [] }));
+  /*
+   * Set by the first chunk the API refuses for the day's D1 budget. Every lane stops at its
+   * next unit, like the key breaker below, and nothing else is posted: each later chunk would
+   * be refused the same way, and the game servers would be asked for data nobody can store.
+   */
+  let paused: BudgetPause | null = null;
   const flush = async (buf: WorldBuffer) => {
     /*
      * SINGLE FLIGHT PER BUFFER. Two call sites can reach the same buffer concurrently (the
@@ -569,7 +582,7 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
      * and `buf.busy = job`), which is what makes the lock sound in single-threaded JS.
      */
     while (buf.busy) await buf.busy;
-    if (!buf.scanned.length) return;
+    if (paused || !buf.scanned.length) return;
     if (buf.retryAfter && Date.now() < buf.retryAfter) return;
     /*
      * Snapshot the lengths BEFORE the await, and on success remove exactly that many.
@@ -585,15 +598,24 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
       const nScanned = buf.scanned.length;
       const nListings = buf.listings.length;
       try {
-        stats.rowsWritten += await postChunk(
+        // Not `stats.rowsWritten += await ...`: that reads the total before the await and
+        // writes it back after, so two flushes in flight at once lose all but one increment.
+        const written = await postChunk(
           buf.world.id,
           buf.scanned.slice(0, nScanned),
           buf.listings.slice(0, nListings),
         );
+        stats.rowsWritten += written;
         buf.scanned.splice(0, nScanned);
         buf.listings.splice(0, nListings);
         buf.retryAfter = undefined;
       } catch (err) {
+        if (err instanceof BudgetPause) {
+          if (!paused) console.warn(`  world ${buf.world.id}: ${err.message}. Pausing the run: D1 daily budget`);
+          paused ??= err;
+          stats.paused = true;
+          return;
+        }
         stats.ingestErrors++;
         buf.retryAfter = Date.now() + 60_000;
         console.warn(`  world ${buf.world.id}: ingest failed, kept ${buf.scanned.length} units buffered: ${(err as Error).message}`);
@@ -649,14 +671,14 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
   const worker = async (): Promise<void> => {
     for (;;) {
       const w = nextWorld++;
-      if (w >= queue.length || abort) return;
+      if (w >= queue.length || abort || paused) return;
       if (Date.now() > deadline) {
         stats.truncated = true;
         return;
       }
       const buf = buffers[w];
       for (const item of queue[w].work) {
-        if (abort) return;
+        if (abort || paused) return;
         if (Date.now() > deadline) {
           stats.truncated = true;
           break;
@@ -706,10 +728,14 @@ export async function captureShopping(opts: CaptureOptions): Promise<CaptureStat
   await Promise.all(Array.from({ length: workers }, () => worker()));
 
   for (const buf of buffers) {
+    // After a budget pause the last chance would be refused too: what is still buffered is
+    // left to the first run after the reset, which verifies it again.
+    if (paused) break;
     buf.retryAfter = undefined; // the end of the run is this data's last chance: always try
     await flush(buf);
   }
   stats.worldsDone = touched.size;
+  if (paused) stats.unsent = buffers.reduce((n, b) => n + b.scanned.length, 0);
   if (abort) throw abort;
 
   // Plan versus reality, so the next person tuning this reads measurements instead of hopes.

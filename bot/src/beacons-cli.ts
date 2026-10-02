@@ -22,7 +22,16 @@
 
 import { config } from "./config.ts";
 import { encodePlotRuns, BeaconKeyError, buildSettlements, fetchBeacons } from "./beacons.ts";
-import { postIngest, getJson, jsonObject, retryableStatus, describeFailure } from "./http.ts";
+import {
+  postIngest,
+  getJson,
+  jsonObject,
+  retryableStatus,
+  describeFailure,
+  BudgetPause,
+  d1BudgetAllowsCapture,
+  isBudgetRefusal,
+} from "./http.ts";
 
 function arg(name: string): string | undefined {
   const hit = process.argv.slice(2).find((a) => a.startsWith(`--${name}=`));
@@ -81,6 +90,9 @@ async function postBeacons(payload: unknown): Promise<IngestResult> {
     if (!data) throw new Error(`ingest answered HTTP ${res.status} with a body that is not JSON`);
     return { rows: data.rows ?? 0, plots: data.plots ?? "skipped", plotsError: data.plotsError };
   }
+  // The day's D1 budget is spent: every later world would be refused the same way, so this
+  // ends the sweep rather than the world (see the loop in main).
+  if (isBudgetRefusal(res)) throw new BudgetPause(`ingest ${describeFailure(res)}`);
   // 401 means the token is wrong. The shared helper never retries it; say so plainly, because
   // it is the one failure here that no amount of waiting fixes.
   if (res.status === 401) throw new Error("ingest rejected the token (401)");
@@ -90,6 +102,9 @@ async function postBeacons(payload: unknown): Promise<IngestResult> {
 async function main(): Promise<void> {
   const filter = arg("worlds")?.split(",").map(Number).filter(Number.isFinite);
   const dryRun = hasFlag("dry-run");
+  // A day whose D1 budget is already spent is skipped before it asks a single world for its
+  // beacons. Not a failure: tomorrow's scheduled sweep carries on.
+  if (!dryRun && !(await d1BudgetAllowsCapture("beacons"))) return;
   const deadline = Date.now() + config.beaconTimeBudgetMs;
 
   const all = (await getJson<{ results: WorldRow[] }>("/api/v2/worlds?limit=500")).results;
@@ -102,6 +117,11 @@ async function main(): Promise<void> {
   let runId = 0;
   if (!dryRun) {
     const startRes = await postIngest("/api/ingest/beacons/run", { action: "start" }, { attempts: 1 });
+    // The one refusal that is not best-effort: the budget ran out since the check above.
+    if (isBudgetRefusal(startRes)) {
+      console.log(`D1 daily budget nearly used (${describeFailure(startRes)}): skipping this run`);
+      return;
+    }
     runId = jsonObject<{ id?: number }>(startRes)?.id ?? 0;
   }
 
@@ -112,6 +132,7 @@ async function main(): Promise<void> {
   let rows = 0;
   let totalBeacons = 0;
   let truncated = false;
+  let paused = false;
   // Plot-map outcomes, tallied so a sweep that stops updating boundaries is explainable from
   // the run row rather than only from a log nobody reads.
   let plotsStored = 0;
@@ -124,6 +145,8 @@ async function main(): Promise<void> {
       console.log("time budget reached, the rest waits for the next run");
       break;
     }
+    // Beacons this world added to the totals, so a refused post can take them back out.
+    let counted = -1;
     try {
       const pack = await fetchBeacons(w.api_url!);
       if (!pack) {
@@ -134,6 +157,7 @@ async function main(): Promise<void> {
       const settlements = buildSettlements(pack);
       totalBeacons += pack.beacons.length;
       done++;
+      counted = pack.beacons.length;
       console.log(
         `  ${w.display_name.padEnd(20)} ${String(pack.beacons.length).padStart(4)} beacons, ` +
           `${String(settlements.length).padStart(4)} clusters`,
@@ -201,6 +225,17 @@ async function main(): Promise<void> {
         process.exitCode = 1;
         return;
       }
+      if (err instanceof BudgetPause) {
+        // This world was captured but not stored, and neither would any after it be. It leaves
+        // the totals, so the run row counts only what was written.
+        if (counted >= 0) {
+          done--;
+          totalBeacons -= counted;
+        }
+        paused = true;
+        console.log(`  ${w.display_name}: ${err.message}. Pausing the sweep: D1 daily budget`);
+        break;
+      }
       errors++;
       console.warn(`  ${w.display_name}: ${(err as Error).message}`);
     }
@@ -216,7 +251,7 @@ async function main(): Promise<void> {
   console.log(
     `\ndone in ${mins} min: ${done} worlds, ${totalBeacons.toLocaleString()} beacons, ` +
       `${rows.toLocaleString()} rows written, ${skipped} skipped, ${errors} errors` +
-      (truncated ? " (time budget reached)" : ""),
+      (paused ? " (paused: D1 daily budget)" : truncated ? " (time budget reached)" : ""),
   );
   if (!dryRun) console.log(`  ${plotNote}`);
 
@@ -227,7 +262,7 @@ async function main(): Promise<void> {
       // Folded into the note because `beacon_runs` has no column for it. A rejected or
       // un-sent grid is now visible in the admin dashboard's run list instead of only in a
       // job log that expires.
-      note: (truncated ? "time budget reached" : "ok") + `; ${plotNote}`,
+      note: (paused ? "paused: D1 daily budget" : truncated ? "time budget reached" : "ok") + `; ${plotNote}`,
     });
   }
 }
