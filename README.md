@@ -8,11 +8,13 @@ because it holds no secrets, only the jobs; every credential arrives as an Actio
 
 | Workflow | Cadence | What it does |
 |---|---|---|
-| `poll-worlds.yml` | every 10 minutes | world discovery, plus an immediate pass over newly spawned worlds |
+| `poll-worlds.yml` | every 30 minutes | world discovery, plus an immediate pass over newly spawned worlds |
 | `steam-capture.yml` | every 6 hours | authenticated discovery, block colours, resources, closest-world distances |
 | `shopping-capture.yml` | every 2 hours | shop prices from the official Shopping API: a cheap "hot" pass over known listings, then a rotating item shard to find new ones |
-| `map-capture.yml` | 03:41 and 15:41 UTC | planet maps from the official LOD0 API, one world at a time |
-| `keepalive.yml` | weekly | keeps the scheduled workflows enabled |
+| `shopping-full.yml` | 00:07, 08:07 and 16:07 UTC | a full shop pass over a rotating segment of every live world, plus the daily price rollup |
+| `beacons-capture.yml` | 05:17 UTC | every beacon, settlement cluster and plot-ownership map |
+| `map-capture.yml` | 03:41 and 15:41 UTC, plus :11 every 6 hours | planet maps from the official LOD0 API, one world at a time |
+| `keepalive.yml` | 1st and 15th of the month | keeps the scheduled workflows enabled |
 
 Each workflow lists the secrets it needs at the top of its file.
 
